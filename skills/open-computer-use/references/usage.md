@@ -40,6 +40,7 @@ type_text
 press_key
 set_value
 select_text   (macOS runtime only)
+key_sequence  (macOS runtime only)
 ```
 
 macOS also exposes `query` for targeted AX lookup. These nine core tools remain the cross-platform compatibility surface. The bundled Codex plugin uses a
@@ -262,6 +263,19 @@ turn/connection cleanup remain available when disabled.
 
 `sky_key` types into whatever element the target window has focused, so click or AX-focus the field first. It fails closed for hidden apps (`cmd+h`), stale window ids, and missing private symbols; Windows and Linux return an unsupported error.
 
+### Held keys and games (macOS)
+
+Games read held keys every frame, so a plain `press_key` tap (key-down and key-up back to back) moves nothing. Two macOS options:
+
+- `press_key` `hold_ms` (0-10000) keeps one key down that long: `{"app":"Roblox Studio","key":"w","key_method":"sky_key","hold_ms":1200}`.
+- `key_sequence` runs overlapping keys on one timeline. Each step has exactly one of `down`, `up`, `press` or `wait_ms`; the whole list is validated before anything is sent, keys still held at the end are always released, and the limits are 200 steps and 10 s of waits. Walk and jump:
+
+```json
+{"app":"Roblox Studio","key_method":"sky_key","steps":[{"down":"w"},{"wait_ms":400},{"press":"space"},{"wait_ms":800},{"up":"w"}]}
+```
+
+Game views (Roblox Studio and similar) are opaque to Accessibility: click them by window coordinates with `click_method: "sky_click"` and send keys with `key_method: "sky_key"`; the default `auto` methods do not reach them. Each call blocks until its keys are released, so it cannot react mid-sequence.
+
 ## Drag Delivery
 
 `drag` has no method parameter. On macOS the path it takes is decided by the same process-level gate that authorizes `click_method: "global"`:
@@ -292,6 +306,9 @@ the app or fall back to keyboard/pointer input. Linux and Windows do not impleme
 `select_text` yet.
 
 ## Software Cursor
+
+A cursor with no current position (a new session, or after the 30 s idle hide) starts its first move
+where it was last seen, else at the user's real pointer, instead of flying in from the screen origin.
 
 The software cursor keeps a window-relative anchor for its target point. During travel, settle, click
 feedback and idle, it follows changes to the target window's frame. If the window moves during travel,
