@@ -121,6 +121,13 @@ public final class ComputerUseToolDispatcher {
             return try service.pressKey(
                 app: requireString("app", in: arguments),
                 key: requireString("key", in: arguments),
+                keyMethod: try parseKeyMethod(optionalString("key_method", in: arguments)),
+                holdMilliseconds: optionalDouble("hold_ms", in: arguments) ?? 0
+            )
+        case "key_sequence":
+            return try service.keySequence(
+                app: requireString("app", in: arguments),
+                steps: try KeySequence.parse(arguments["steps"]),
                 keyMethod: try parseKeyMethod(optionalString("key_method", in: arguments))
             )
         case "set_value":

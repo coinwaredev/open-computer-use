@@ -1133,7 +1133,13 @@ public final class ComputerUseService {
         return (focused as! AXUIElement)
     }
 
-    public func pressKey(app query: String, key: String, keyMethod: KeyMethod = .auto) throws -> ToolCallResult {
+    public static let maximumKeyHoldMilliseconds = 10_000.0
+
+    public func pressKey(app query: String, key: String, keyMethod: KeyMethod = .auto, holdMilliseconds: Double = 0) throws -> ToolCallResult {
+        guard holdMilliseconds.isFinite, holdMilliseconds >= 0, holdMilliseconds <= Self.maximumKeyHoldMilliseconds else {
+            throw ComputerUseError.invalidArguments("hold_ms must be between 0 and \(Int(Self.maximumKeyHoldMilliseconds))")
+        }
+        let hold = holdMilliseconds / 1000
         let snapshot = try currentSnapshot(for: query)
         if snapshot.mode == .fixture {
             try requireAutoKeyMethodForFixture(keyMethod)
@@ -1144,14 +1150,34 @@ public final class ComputerUseService {
 
         if keyMethod == .skyKey {
             let target = try skyKeyTarget(for: snapshot)
-            try InputSimulation.pressKeyWithSkyLight(key, windowID: target.windowID, pid: target.pid)
+            try InputSimulation.pressKeyWithSkyLight(key, windowID: target.windowID, pid: target.pid, hold: hold)
             return snapshotResult(
                 for: try refreshSnapshot(for: query, recoveryPolicy: keyActionSnapshotRecoveryPolicy(for: keyMethod)),
                 style: .actionResult
             )
         }
 
-        try InputSimulation.pressKey(key, pid: snapshot.app.pid)
+        try InputSimulation.pressKey(key, pid: snapshot.app.pid, hold: hold)
+        return try actionResult(for: query)
+    }
+
+    public func keySequence(app query: String, steps: [KeySequenceStep], keyMethod: KeyMethod = .auto) throws -> ToolCallResult {
+        let resolved = try KeySequence.resolve(steps)
+        let snapshot = try currentSnapshot(for: query)
+        if snapshot.mode == .fixture {
+            throw ComputerUseError.message("key_sequence is not supported for fixture apps")
+        }
+
+        if keyMethod == .skyKey {
+            let target = try skyKeyTarget(for: snapshot)
+            try SkyKeyboardDispatcher.keySequence(target: target, steps: resolved)
+            return snapshotResult(
+                for: try refreshSnapshot(for: query, recoveryPolicy: keyActionSnapshotRecoveryPolicy(for: keyMethod)),
+                style: .actionResult
+            )
+        }
+
+        try KeySequence.run(resolved, pid: snapshot.app.pid)
         return try actionResult(for: query)
     }
 

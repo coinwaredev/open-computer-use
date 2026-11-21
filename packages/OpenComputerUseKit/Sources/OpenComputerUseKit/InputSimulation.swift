@@ -110,10 +110,11 @@ enum InputSimulation {
         )
     }
 
-    static func pressKeyWithSkyLight(_ specification: String, windowID: CGWindowID, pid: pid_t) throws {
+    static func pressKeyWithSkyLight(_ specification: String, windowID: CGWindowID, pid: pid_t, hold: TimeInterval = 0) throws {
         try SkyKeyboardDispatcher.pressKey(
             target: SkyKeyboardTarget(windowID: windowID, pid: pid),
-            key: specification
+            key: specification,
+            hold: hold
         )
     }
 
@@ -250,7 +251,9 @@ enum InputSimulation {
         return chunks
     }
 
-    static func pressKey(_ specification: String, pid: pid_t) throws {
+    /// `hold` keeps the key down that long before key-up: games read held keys per frame, so a
+    /// zero-length tap starts and ends inside one frame and never moves a character.
+    static func pressKey(_ specification: String, pid: pid_t, hold: TimeInterval = 0) throws {
         try requireUsableComputerUseSession()
         let parsed = try KeyPressParser.parse(specification)
         var activeFlags: CGEventFlags = []
@@ -273,6 +276,9 @@ enum InputSimulation {
         keyDown.flags = activeFlags
         keyUp.flags = activeFlags
         keyDown.postToPid(pid)
+        if hold > 0 {
+            Thread.sleep(forTimeInterval: hold)
+        }
         keyUp.postToPid(pid)
 
         for modifier in parsed.modifiers.reversed() {

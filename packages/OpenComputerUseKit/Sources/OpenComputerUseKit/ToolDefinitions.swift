@@ -152,8 +152,39 @@ public enum ToolDefinitions {
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "key": stringProperty(description: "Key or key combination to press"),
                     "key_method": keyMethodProperty(),
+                    "hold_ms": numberProperty(description: "Optional: hold the key down this many milliseconds (0-10000) before releasing, for games that read held keys. Default 0 (tap)."),
                 ],
                 required: ["app", "key"]
+            )
+        ),
+        ToolDefinition(
+            name: "key_sequence",
+            description: "Hold, release and tap keys on one timeline so keys can overlap, for example hold W, tap Space, keep walking. Steps run in order in one call; each step is an object with exactly one of `down` (hold one key or modifier), `up` (release a held key), `press` (tap a key or chord, press_key syntax) or `wait_ms` (pause while held keys stay down). Keys still held at the end are released. Limits: \(KeySequence.maximumSteps) steps, \(Int(KeySequence.maximumTotalWaitMilliseconds)) ms of waits. Games usually need key_method `sky_key`. Example steps: [{\"down\":\"w\"},{\"wait_ms\":300},{\"press\":\"space\"},{\"wait_ms\":700},{\"up\":\"w\"}]. This tool is part of plugin `Computer Use`.",
+            annotations: defaultAnnotations(),
+            inputSchema: objectSchema(
+                properties: [
+                    "app": stringProperty(description: "App name or bundle identifier"),
+                    "steps": [
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": KeySequence.maximumSteps,
+                        "description": "Timeline steps, each an object with exactly one of down, up, press (strings) or wait_ms (number).",
+                        "items": [
+                            "type": "object",
+                            "minProperties": 1,
+                            "maxProperties": 1,
+                            "properties": [
+                                "down": ["type": "string"],
+                                "up": ["type": "string"],
+                                "press": ["type": "string"],
+                                "wait_ms": ["type": "number", "minimum": 0],
+                            ],
+                            "additionalProperties": false,
+                        ] as [String: Any],
+                    ] as [String: Any],
+                    "key_method": keyMethodProperty(),
+                ],
+                required: ["app", "steps"]
             )
         ),
         ToolDefinition(

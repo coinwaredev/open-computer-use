@@ -116,12 +116,13 @@ enum SkyKeyboardDispatcher {
     static func pressKey(
         target: SkyKeyboardTarget,
         key: String,
+        hold: TimeInterval = 0,
         spi: SkyLightSPI = .shared
     ) throws {
         // Reject bad key specs before touching the target's focus state.
         let parsed = try KeyPressParser.parse(key)
         try deliver(to: target, spi: spi) {
-            if let equivalent = skyMenuKeyEquivalent(for: parsed),
+            if hold <= 0, let equivalent = skyMenuKeyEquivalent(for: parsed),
                let item = menuItem(matching: equivalent, pid: target.pid) {
                 try requireUsableComputerUseSession()
                 let result = AXUIElementPerformAction(item, kAXPressAction as CFString)
@@ -134,7 +135,17 @@ enum SkyKeyboardDispatcher {
                 return
             }
 
-            try InputSimulation.pressKey(key, pid: target.pid)
+            try InputSimulation.pressKey(key, pid: target.pid, hold: hold)
+        }
+    }
+
+    static func keySequence(
+        target: SkyKeyboardTarget,
+        steps: [KeySequence.Resolved],
+        spi: SkyLightSPI = .shared
+    ) throws {
+        try deliver(to: target, spi: spi) {
+            try KeySequence.run(steps, pid: target.pid)
         }
     }
 
