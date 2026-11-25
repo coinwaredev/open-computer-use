@@ -42,6 +42,7 @@ set_value
 select_text   (macOS runtime only)
 key_sequence  (macOS runtime only)
 choose_file   (macOS runtime only)
+hover         (macOS runtime only)
 ```
 
 macOS also exposes `query` for targeted AX lookup. These nine core tools remain the cross-platform compatibility surface. The bundled Codex plugin uses a
@@ -277,6 +278,18 @@ Games read held keys every frame, so a plain `press_key` tap (key-down and key-u
 
 Game views (Roblox Studio and similar) are opaque to Accessibility: click them by window coordinates with `click_method: "sky_click"` and send keys with `key_method: "sky_key"`; the default `auto` methods do not reach them. Each call blocks until its keys are released, so it cannot react mid-sequence.
 
+### Pointer input without an element (macOS)
+
+These go to the target window through SkyLight, like `sky_click`: the window stays where it is, nothing comes to the front and the real pointer does not move.
+
+- `scroll` without `element_index` sends wheel notches at a screenshot point (`x`/`y`), or at the window's centre when neither is given. In a game view the wheel zooms the camera: `{"app":"Roblox Studio","direction":"up","x":640,"y":360,"pages":0.5}`. A page is 12 lines, sent as notches of 3.
+- `drag` takes `mouse_button` (`left`, `right`, `middle`) and `duration_ms` (default 250). A right drag turns the camera in many 3D views: `{"app":"Roblox Studio","from_x":500,"from_y":360,"to_x":700,"to_y":360,"mouse_button":"right","duration_ms":400}`. A left drag works on in-game controls such as a drag-to-turn preview. Each dragged event carries whole-pixel deltas that add up to the full distance, since a camera reads the deltas, not the position.
+- `hover` moves the pointer over an element or a screenshot point without pressing, so hover styles and hover menus show in the returned state. System tooltips take about a second; read the app again for those. `OPEN_COMPUTER_USE_HOVER_SETTLE_MS` (default 150) sets the wait before the read-back. Qt apps, Roblox Studio among them, ignore it: Qt passes a move only to the window it thinks is under the real pointer.
+
+A right drag in a Roblox game turns the camera (about 25 degrees for 300 screenshot pixels in Studio), and the wheel zooms it. Roblox locks the mouse for the turn and warps the real pointer to where the button went down; `drag` puts the pointer back afterwards when it finds it on the drag's own path, and says so in the result. If the target took the foreground during a drag, the previous app is brought back and the result says that too.
+
+In Chrome, a covered window hides its page until it has been in view once (see `get_app_state`'s note), and mouse moves sent before that are dropped; the wheel still lands. During a drag Chrome reports `event.buttons` as 0, because it reads the real mouse buttons, so a page that tracks the drag from `mousedown` works and one that checks `buttons` on each move does not.
+
 ### File pickers (macOS)
 
 An Open panel's file list is drawn by a separate macOS service, so `press_key` (`cmd+shift+g`, Go to Folder), `type_text` and pointer clicks of any method never reach it. Accessibility does. Open the panel with the app's own menu item, then call `choose_file` with the file's path:
@@ -291,12 +304,13 @@ It refuses hidden paths (dot-files, `/tmp`, `/private`), folders, Save panels, a
 
 ## Drag Delivery
 
-`drag` has no method parameter. On macOS the path it takes is decided by the same process-level gate that authorizes `click_method: "global"`:
+`drag_method` picks the path. The default `auto` uses `sky`, then `app_post` if SkyLight is unavailable; when the process-level gate `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1` is set it uses `global` instead, as before.
 
-- Gate unset (default): mouse move / down / dragged / up events are posted directly to the target process with `CGEvent.postToPid`. The system pointer does not move and foreground focus is unchanged. Because the events never pass through the window server, this path cannot start a window-server drag session: window moves, drag-selecting text, and Finder drag-and-drop return without error but have no visible effect.
-- `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1` set for the server process: the drag uses the global pointer path, which drives window-server drag sessions but may move the real pointer and change foreground focus.
+- `sky`: SkyLight events stamped with the target window, any mouse button. A background window takes the drag and the system pointer does not move. It does not start window-server drag sessions: window moves and Finder drag-and-drop need `global`.
+- `app_post`: mouse events posted to the target process with `CGEvent.postToPid`. The system pointer does not move, but a background Cocoa window drops these presses, and window-server drag sessions are not driven.
+- `global`: the global pointer path. It drives window-server drag sessions but may move the real pointer and change foreground focus, so it requires the gate.
 
-Every non-fixture `drag` result includes a text item that begins `Drag delivered via app_post` or `Drag delivered via global pointer path`, so a default drag that did nothing is legible instead of looking like success. For an MCP server the variable belongs in the server entry's `env`, not in the calling shell, and the server must be restarted afterwards.
+Every non-fixture `drag` result includes a text item that begins `Drag delivered via sky`, `Drag delivered via app_post` or `Drag delivered via global pointer path`, so a drag that did nothing is legible instead of looking like success. For an MCP server the variable belongs in the server entry's `env`, not in the calling shell, and the server must be restarted afterwards.
 
 When the gate is not enabled, treat window-server drags as unavailable and reach the same outcome another way: copy or move files with a shell command instead of a Finder drag, use `set_value` or keyboard selection instead of drag-selecting text, and use the app's own window controls instead of dragging a title bar.
 

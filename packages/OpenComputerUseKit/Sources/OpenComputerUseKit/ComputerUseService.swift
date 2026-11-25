@@ -271,9 +271,11 @@ func actionReadBackEnabled(environment: [String: String]) -> Bool {
     return !["0", "false", "no", "off"].contains(rawValue)
 }
 
-/// How a `drag` is delivered. `drag` has no method argument; the path is decided
-/// by the same process-level gate that authorizes `click_method=global`.
+/// How a `drag` is delivered.
 enum DragDeliveryPath: String, CaseIterable {
+    /// SkyLight events stamped with the target window: a background window takes
+    /// the drag with any button, the system pointer does not move.
+    case sky
     /// `CGEvent.postToPid`: never moves the system pointer, but the events do not
     /// pass through the window server, so window-server drag sessions (window
     /// moves, text selection, Finder drag-and-drop) are not driven.
@@ -283,12 +285,66 @@ enum DragDeliveryPath: String, CaseIterable {
     case global
 }
 
+/// The `drag_method` argument. `auto` keeps the process-level gate: global when
+/// OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS is on, otherwise sky with
+/// app_post as the fallback.
+public enum DragMethod: String, CaseIterable, Sendable {
+    case auto
+    case sky
+    case appPost = "app_post"
+    case global
+}
+
+func parseDragMethod(_ rawValue: String?) throws -> DragMethod {
+    let normalized = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? DragMethod.auto.rawValue
+    guard let method = DragMethod(rawValue: normalized) else {
+        let expected = DragMethod.allCases.map(\.rawValue).joined(separator: ", ")
+        throw ComputerUseError.message("Invalid drag_method '\(rawValue ?? "")'. Expected one of: \(expected)")
+    }
+    return method
+}
+
 func dragDeliveryPath(environment: [String: String]) -> DragDeliveryPath {
     globalPointerFallbacksEnabled(environment: environment) ? .global : .appPost
 }
 
+/// The paths `drag` tries, in order. `auto` without the global gate tries sky first:
+/// a background Cocoa window drops pid-posted presses.
+func dragDeliveryPlan(method: DragMethod, environment: [String: String]) throws -> [DragDeliveryPath] {
+    switch method {
+    case .auto:
+        return globalPointerFallbacksEnabled(environment: environment) ? [.global] : [.sky, .appPost]
+    case .sky:
+        return [.sky]
+    case .appPost:
+        return [.appPost]
+    case .global:
+        guard globalPointerFallbacksEnabled(environment: environment) else {
+            throw ComputerUseError.message(
+                "drag_method 'global' requires OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1 because it may move the system pointer and change foreground focus"
+            )
+        }
+        return [.global]
+    }
+}
+
+func dragSideEffectNote(_ effects: SkyPointerSideEffects) -> String? {
+    var parts: [String] = []
+    if effects.restoredPointer {
+        parts.append("The app warped the real pointer onto the drag (a mouse lock, as a game camera does); it was moved back.")
+    }
+    if effects.targetTookFront {
+        parts.append(effects.restoredFrontApp
+            ? "The app came to the front during the drag; the previous app was brought back."
+            : "The app came to the front during the drag and the previous app could not be brought back.")
+    }
+    return parts.isEmpty ? nil : parts.joined(separator: " ")
+}
+
 func dragDeliveryNote(for path: DragDeliveryPath) -> String {
     switch path {
+    case .sky:
+        return "Drag delivered via sky: SkyLight events were posted to the target window, which took them without coming to the front; the system pointer did not move. Window-server drag sessions such as window moves and Finder drag-and-drop still need drag_method global with OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1."
     case .appPost:
         return "Drag delivered via app_post: mouse events were posted directly to the target process and the system pointer did not move. This path cannot drive window-server drag sessions such as window moves, text selection, or Finder drag-and-drop. If the drag had no effect, set OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1 in the server process environment to use the global pointer path, which may move the real pointer and change foreground focus."
     case .global:
@@ -704,6 +760,7 @@ public final class ComputerUseService {
     private var snapshotsByApp: [String: AppSnapshot] = [:]
     /// 本次 click 里有写入已发出但没核实到效果时的说明；click 返回前取走附到结果上。
     private var pendingClickDeliveryNote: String?
+    private var lastDragSideEffects = SkyPointerSideEffects()
     private var invalidatedSnapshotAliases: Set<String> = []
     // Read per call: the app agent applies the caller's OPEN_COMPUTER_USE_* variables
     // for the duration of each request.
@@ -1032,13 +1089,26 @@ public final class ComputerUseService {
         return try actionResult(for: query)
     }
 
-    public func scroll(app query: String, direction: String, elementIndex: String, pages: Double) throws -> ToolCallResult {
+    public func scroll(
+        app query: String,
+        direction: String,
+        elementIndex: String?,
+        x: Double? = nil,
+        y: Double? = nil,
+        pages: Double
+    ) throws -> ToolCallResult {
         let normalized = direction.lowercased()
         guard ["up", "down", "left", "right"].contains(normalized) else {
             throw ComputerUseError.message("Invalid scroll direction: \(direction)")
         }
         guard pages.isFinite, pages > 0 else {
             throw ComputerUseError.message("pages must be > 0")
+        }
+        guard let elementIndex else {
+            return try scrollAtPoint(app: query, direction: normalized, x: x, y: y, pages: pages)
+        }
+        guard x == nil, y == nil else {
+            throw ComputerUseError.message("scroll takes element_index or x/y, not both")
         }
 
         let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex)
@@ -1076,7 +1146,21 @@ public final class ComputerUseService {
         return try actionResult(for: query)
     }
 
-    public func drag(app query: String, fromX: Double, fromY: Double, toX: Double, toY: Double) throws -> ToolCallResult {
+    public func drag(
+        app query: String,
+        fromX: Double,
+        fromY: Double,
+        toX: Double,
+        toY: Double,
+        mouseButton: String = "left",
+        durationMilliseconds: Double? = nil,
+        dragMethod: DragMethod = .auto
+    ) throws -> ToolCallResult {
+        guard let button = MouseButtonKind(rawValue: mouseButton.lowercased()) else {
+            throw ComputerUseError.message("mouse_button must be left, right or middle")
+        }
+        let duration = try pointerDuration(durationMilliseconds, default: 0.25)
+        let plan = try dragDeliveryPlan(method: dragMethod, environment: ProcessInfo.processInfo.environment)
         let snapshot = try currentSnapshot(for: query)
         guard snapshot.observation.includeScreenshot else {
             throw ComputerUseError.stateUnavailable(SnapshotObservationOptions.screenshotOmittedNote + "; request a screenshot before screenshot-coordinate actions")
@@ -1087,18 +1171,134 @@ public final class ComputerUseService {
             return try actionResult(for: query)
         }
 
-        let start = try screenshotToGlobalPoint(snapshot: snapshot, x: fromX, y: fromY)
-        let end = try screenshotToGlobalPoint(snapshot: snapshot, x: toX, y: toY)
+        let start = try pointerPoint(snapshot: snapshot, x: fromX, y: fromY)
+        let end = try pointerPoint(snapshot: snapshot, x: toX, y: toY)
+        let cursorStart = pointerCursorTarget(snapshot: snapshot, point: start)
+        let cursorEnd = pointerCursorTarget(snapshot: snapshot, point: end)
+        moveVisualCursor(to: cursorStart)
         let path = try performDragEvent(
+            plan: plan,
+            button: button,
             from: start,
             to: end,
+            duration: duration,
             targetDescription: "from=(\(Int(fromX)), \(Int(fromY))) to=(\(Int(toX)), \(Int(toY)))",
             snapshot: snapshot
         )
-        return appendingDragDeliveryNote(
-            to: try actionResult(for: query),
+        settleVisualCursor(at: cursorEnd)
+        if path == .sky { pauseBeforeReadBack(InputTiming.pointerReadBackSettle, capped: false) }
+        let effects = lastDragSideEffects
+        lastDragSideEffects = SkyPointerSideEffects()
+        var result = appendingDragDeliveryNote(
+            to: try actionResult(for: query, recoveryPolicy: path == .sky ? .readOnly : .allowActivation),
             path: path
         )
+        if let note = dragSideEffectNote(effects) {
+            result = appendingResultNote(note, to: result)
+        }
+        return result
+    }
+
+    /// Move the pointer over a point without pressing, through SkyLight, so hover
+    /// states, tooltips and hover menus show in a background window.
+    public func hover(app query: String, elementIndex: String?, x: Double?, y: Double?) throws -> ToolCallResult {
+        let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex)
+        if snapshot.mode == .fixture {
+            throw ComputerUseError.message("hover is not supported for fixture apps")
+        }
+        let point: SkyPointerPoint
+        if let elementIndex {
+            guard x == nil, y == nil else {
+                throw ComputerUseError.message("hover takes element_index or x/y, not both")
+            }
+            let record = try lookupElement(snapshot: snapshot, index: elementIndex)
+            guard let windowPoint = clickPoint(for: record, snapshot: snapshot) else {
+                throw ComputerUseError.stateUnavailable("element \(elementIndex) has no frame to hover")
+            }
+            point = SkyPointerPoint(screen: try windowPointToGlobalPoint(snapshot: snapshot, point: windowPoint), window: windowPoint)
+        } else if let x, let y {
+            guard snapshot.observation.includeScreenshot else {
+                throw ComputerUseError.stateUnavailable(SnapshotObservationOptions.screenshotOmittedNote + "; request a screenshot before screenshot-coordinate actions")
+            }
+            point = try pointerPoint(snapshot: snapshot, x: x, y: y)
+        } else {
+            throw ComputerUseError.message("hover requires either element_index or x/y")
+        }
+
+        let target = try skyPointerTarget(snapshot: snapshot, tool: "hover")
+        moveVisualCursor(to: pointerCursorTarget(snapshot: snapshot, point: point))
+        try SkyPointerDispatcher.hover(at: point, target: target)
+        // Hover effects and tooltips appear after the app's own delay.
+        pauseBeforeReadBack(InputTiming.hoverSettle, capped: false)
+        return try actionResult(for: query, recoveryPolicy: .readOnly)
+    }
+
+    /// `scroll` without an element: wheel events at a screenshot point, or at the
+    /// window's centre, for views with no accessibility tree (game views, canvases).
+    private func scrollAtPoint(app query: String, direction: String, x: Double?, y: Double?, pages: Double) throws -> ToolCallResult {
+        guard (x == nil) == (y == nil) else {
+            throw ComputerUseError.message("scroll needs both x and y, or neither")
+        }
+        let snapshot = try currentSnapshot(for: query)
+        if snapshot.mode == .fixture {
+            throw ComputerUseError.message("fixture scroll requires element_index")
+        }
+        let point: SkyPointerPoint
+        if let x, let y {
+            guard snapshot.observation.includeScreenshot else {
+                throw ComputerUseError.stateUnavailable(SnapshotObservationOptions.screenshotOmittedNote + "; request a screenshot before screenshot-coordinate actions")
+            }
+            point = try pointerPoint(snapshot: snapshot, x: x, y: y)
+        } else {
+            guard let bounds = snapshot.windowBounds else {
+                throw ComputerUseError.stateUnavailable("No window bounds are available. Run get_app_state after bringing the app on screen.")
+            }
+            let centre = CGPoint(x: bounds.width / 2, y: bounds.height / 2)
+            point = SkyPointerPoint(screen: try windowPointToGlobalPoint(snapshot: snapshot, point: centre), window: centre)
+        }
+        moveVisualCursor(to: pointerCursorTarget(snapshot: snapshot, point: point))
+
+        if globalPointerFallbacksEnabled(environment: ProcessInfo.processInfo.environment) {
+            try performScrollEvent(at: point.screen, direction: direction, pages: pages, targetDescription: "x/y", snapshot: snapshot)
+        } else {
+            do {
+                try SkyPointerDispatcher.scroll(at: point, direction: direction, pages: pages, target: try skyPointerTarget(snapshot: snapshot, tool: "scroll"))
+            } catch {
+                debugClickDecision("scroll sky unavailable (\(error)); posting to pid")
+                try InputSimulation.scrollTargeted(at: inputEventPoint(fromScreenStatePoint: point.screen), direction: direction, pages: pages, pid: snapshot.app.pid)
+            }
+        }
+        pauseBeforeReadBack(InputTiming.pointerReadBackSettle, capped: false)
+        return try actionResult(for: query, recoveryPolicy: .readOnly)
+    }
+
+    private func pointerPoint(snapshot: AppSnapshot, x: Double, y: Double) throws -> SkyPointerPoint {
+        let window = try screenshotPixelToWindowPointInSnapshot(snapshot: snapshot, point: CGPoint(x: x, y: y))
+        return SkyPointerPoint(screen: try windowPointToGlobalPoint(snapshot: snapshot, point: window), window: window)
+    }
+
+    private func pointerCursorTarget(snapshot: AppSnapshot, point: SkyPointerPoint) -> VisualCursorTarget {
+        makeVisualCursorTarget(
+            at: point.screen,
+            targetWindowID: snapshot.targetWindowID,
+            targetWindowLayer: snapshot.targetWindowLayer,
+            anchor: makeCursorWindowAnchor(snapshot: snapshot, windowLocalPoint: point.window, cursor: visualCursor)
+        )
+    }
+
+    private func skyPointerTarget(snapshot: AppSnapshot, tool: String) throws -> SkyPointerTarget {
+        guard let bounds = snapshot.windowBounds, let windowID = snapshot.targetWindowID else {
+            throw ComputerUseError.stateUnavailable("\(tool) needs the app's current window. Run get_app_state again.")
+        }
+        return SkyPointerTarget(windowBounds: bounds, windowID: windowID, pid: snapshot.app.pid)
+    }
+
+    private func pointerDuration(_ milliseconds: Double?, default fallback: TimeInterval) throws -> TimeInterval {
+        guard let milliseconds else { return fallback }
+        guard milliseconds.isFinite, milliseconds >= 0, milliseconds <= 10_000 else {
+            throw ComputerUseError.message("duration_ms must be between 0 and 10000")
+        }
+        return milliseconds / 1000
     }
 
     public func typeText(app query: String, text: String, keyMethod: KeyMethod = .auto) throws -> ToolCallResult {
@@ -2718,29 +2918,43 @@ public final class ComputerUseService {
     }
 
     private func performDragEvent(
-        from start: CGPoint,
-        to end: CGPoint,
+        plan: [DragDeliveryPath],
+        button: MouseButtonKind,
+        from start: SkyPointerPoint,
+        to end: SkyPointerPoint,
+        duration: TimeInterval,
         targetDescription: String,
         snapshot: AppSnapshot
     ) throws -> DragDeliveryPath {
-        let eventStart = inputEventPoint(fromScreenStatePoint: start)
-        let eventEnd = inputEventPoint(fromScreenStatePoint: end)
-        let path = dragDeliveryPath(environment: ProcessInfo.processInfo.environment)
+        let eventStart = inputEventPoint(fromScreenStatePoint: start.screen)
+        let eventEnd = inputEventPoint(fromScreenStatePoint: end.screen)
+        var lastError: Error?
 
-        switch path {
-        case .global:
-            debugInputFallback(
-                tool: "drag",
-                targetDescription: targetDescription,
-                snapshot: snapshot
-            )
-            InputSimulation.prepareAppForGlobalPointerInput(snapshot.app)
-            try InputSimulation.dragGlobally(from: eventStart, to: eventEnd)
-        case .appPost:
-            try InputSimulation.dragTargeted(from: eventStart, to: eventEnd, pid: snapshot.app.pid)
+        for path in plan {
+            do {
+                switch path {
+                case .sky:
+                    lastDragSideEffects = try SkyPointerDispatcher.drag(
+                        button: button,
+                        from: start,
+                        to: end,
+                        duration: duration,
+                        target: try skyPointerTarget(snapshot: snapshot, tool: "drag")
+                    )
+                case .global:
+                    debugInputFallback(tool: "drag", targetDescription: targetDescription, snapshot: snapshot)
+                    InputSimulation.prepareAppForGlobalPointerInput(snapshot.app)
+                    try InputSimulation.dragGlobally(from: eventStart, to: eventEnd, button: button)
+                case .appPost:
+                    try InputSimulation.dragTargeted(from: eventStart, to: eventEnd, button: button, pid: snapshot.app.pid)
+                }
+                return path
+            } catch {
+                debugClickDecision("drag \(path.rawValue) failed (\(error)) target=\(targetDescription)")
+                lastError = error
+            }
         }
-
-        return path
+        throw lastError ?? ComputerUseError.message("drag has no delivery path")
     }
 
     private func performNonAXClickFallback(

@@ -288,7 +288,7 @@ final class OpenComputerUseKitTests: XCTestCase {
     }
 
     func testToolDefinitionCount() {
-        XCTAssertEqual(ToolDefinitions.all.count, 13)
+        XCTAssertEqual(ToolDefinitions.all.count, 14)
         XCTAssertEqual(
             ToolDefinitions.all.map(\.name).sorted(),
             [
@@ -296,6 +296,7 @@ final class OpenComputerUseKitTests: XCTestCase {
                 "click",
                 "drag",
                 "get_app_state",
+                "hover",
                 "key_sequence",
                 "list_apps",
                 "perform_secondary_action",
@@ -832,7 +833,7 @@ final class OpenComputerUseKitTests: XCTestCase {
         )
         let dragDescription = tools["drag"]?.description ?? ""
         XCTAssertTrue(dragDescription.contains("OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1"))
-        XCTAssertTrue(dragDescription.contains("window moves, text selection, or Finder drag-and-drop"))
+        XCTAssertTrue(dragDescription.contains("window moves or Finder drag-and-drop"))
         XCTAssertTrue(dragDescription.hasSuffix("This tool is part of plugin `Computer Use`."))
         let getAppStateSchema = tools["get_app_state"]?.inputSchema
         let getAppStateProperties = getAppStateSchema?["properties"] as? [String: [String: Any]]

@@ -71,9 +71,16 @@ enum InputTiming {
     /// action call returns once the app has handled it, so the wait only covers the
     /// redraw reaching the window capture: about two display frames. The fixed
     /// 100-150 ms gaps it caps were most of a click's time. Was 150.
+    static let readBackSettle = milliseconds("OPEN_COMPUTER_USE_READ_BACK_SETTLE_MS", default: 40)
     /// How long type_text watches a field's value after an AXSelectedText write before typing with keys.
     static let selectedTextApplyWait = milliseconds("OPEN_COMPUTER_USE_SELECTED_TEXT_APPLY_MS", default: 200)
-    static let readBackSettle = milliseconds("OPEN_COMPUTER_USE_READ_BACK_SETTLE_MS", default: 40)
+    /// Wait between a hover and its read-back, so hover styles and menus have drawn.
+    /// System tooltips take about a second more; read the app again for those.
+    static let hoverSettle = milliseconds("OPEN_COMPUTER_USE_HOVER_SETTLE_MS", default: 150)
+    /// Wait between a SkyLight drag or wheel and its read-back. The events are
+    /// delivered asynchronously: Chrome had drawn one wheel notch of four when the
+    /// result was read straight away.
+    static let pointerReadBackSettle = milliseconds("OPEN_COMPUTER_USE_POINTER_READ_BACK_MS", default: 100)
     /// Gap after each pointer event of a pid-posted click (move, press, release).
     /// A background Cocoa window drops those clicks at any gap, so shorter could not be
     /// verified; the click fallback now tries sky_click first.

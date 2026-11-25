@@ -30,6 +30,17 @@ enum MouseButtonKind: String {
         }
     }
 
+    var draggedEvent: CGEventType {
+        switch self {
+        case .left:
+            return .leftMouseDragged
+        case .right:
+            return .rightMouseDragged
+        case .middle:
+            return .otherMouseDragged
+        }
+    }
+
     var upEvent: CGEventType {
         switch self {
         case .left:
@@ -165,30 +176,30 @@ enum InputSimulation {
         Thread.sleep(forTimeInterval: gap)
     }
 
-    static func dragTargeted(from start: CGPoint, to end: CGPoint, pid: pid_t) throws {
+    static func dragTargeted(from start: CGPoint, to end: CGPoint, button: MouseButtonKind = .left, pid: pid_t) throws {
         guard let source = CGEventSource(stateID: .combinedSessionState) else {
             throw ComputerUseError.message("Failed to create targeted event source.")
         }
-        let release = try mouseRelease(source: source, point: start, button: .left, clickState: 1)
-        try postMouseEventToPid(type: .mouseMoved, source: source, point: start, button: .left, clickState: 1, pid: pid)
+        let release = try mouseRelease(source: source, point: start, button: button, clickState: 1)
+        try postMouseEventToPid(type: .mouseMoved, source: source, point: start, button: button.cgButton, clickState: 1, pid: pid)
         try withPressedMouseButton(press: {
-            try postMouseEventToPid(type: .leftMouseDown, source: source, point: start, button: .left, clickState: 1, pid: pid)
+            try postMouseEventToPid(type: button.downEvent, source: source, point: start, button: button.cgButton, clickState: 1, pid: pid)
         }, release: { postPreparedRelease(release, pid: pid) }) {
             for step in 1...10 {
                 let progress = CGFloat(step) / 10
                 let point = CGPoint(x: start.x + ((end.x - start.x) * progress), y: start.y + ((end.y - start.y) * progress))
-                try postMouseEventToPid(type: .leftMouseDragged, source: source, point: point, button: .left, clickState: 1, pid: pid)
+                try postMouseEventToPid(type: button.draggedEvent, source: source, point: point, button: button.cgButton, clickState: 1, pid: pid)
                 release.location = point
             }
         }
     }
 
-    static func dragGlobally(from start: CGPoint, to end: CGPoint) throws {
+    static func dragGlobally(from start: CGPoint, to end: CGPoint, button: MouseButtonKind = .left) throws {
         let gesture = dragGestureEventNumber()
-        let release = try mouseRelease(source: nil, point: start, button: .left, clickState: 1, eventNumber: gesture)
-        try postMouseEvent(type: .mouseMoved, source: nil, point: start, button: .left, clickState: 1)
+        let release = try mouseRelease(source: nil, point: start, button: button, clickState: 1, eventNumber: gesture)
+        try postMouseEvent(type: .mouseMoved, source: nil, point: start, button: button.cgButton, clickState: 1)
         try withPressedMouseButton(press: {
-            try postMouseEvent(type: .leftMouseDown, source: nil, point: start, button: .left, clickState: 1, eventNumber: gesture)
+            try postMouseEvent(type: button.downEvent, source: nil, point: start, button: button.cgButton, clickState: 1, eventNumber: gesture)
         }, release: { postPreparedRelease(release) }) {
             Thread.sleep(forTimeInterval: 0.05)
             var previous = start
@@ -197,7 +208,7 @@ enum InputSimulation {
                 let progress = CGFloat(step) / CGFloat(steps)
                 let point = CGPoint(x: start.x + ((end.x - start.x) * progress), y: start.y + ((end.y - start.y) * progress))
                 let delta = CGSize(width: point.x - previous.x, height: point.y - previous.y)
-                try postMouseEvent(type: .leftMouseDragged, source: nil, point: point, button: .left, clickState: 1, delta: delta, eventNumber: gesture)
+                try postMouseEvent(type: button.draggedEvent, source: nil, point: point, button: button.cgButton, clickState: 1, delta: delta, eventNumber: gesture)
                 previous = point
                 release.location = point
             }

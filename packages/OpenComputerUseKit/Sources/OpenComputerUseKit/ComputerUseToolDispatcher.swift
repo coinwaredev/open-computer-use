@@ -100,7 +100,9 @@ public final class ComputerUseToolDispatcher {
             return try service.scroll(
                 app: requireString("app", in: arguments),
                 direction: requireString("direction", in: arguments),
-                elementIndex: requireElementIndex(in: arguments),
+                elementIndex: optionalElementIndex(in: arguments),
+                x: optionalDouble("x", in: arguments),
+                y: optionalDouble("y", in: arguments),
                 pages: optionalDouble("pages", in: arguments) ?? 1
             )
         case "drag":
@@ -109,7 +111,17 @@ public final class ComputerUseToolDispatcher {
                 fromX: requireDouble("from_x", in: arguments),
                 fromY: requireDouble("from_y", in: arguments),
                 toX: requireDouble("to_x", in: arguments),
-                toY: requireDouble("to_y", in: arguments)
+                toY: requireDouble("to_y", in: arguments),
+                mouseButton: optionalString("mouse_button", in: arguments) ?? "left",
+                durationMilliseconds: optionalDouble("duration_ms", in: arguments),
+                dragMethod: try parseDragMethod(optionalString("drag_method", in: arguments))
+            )
+        case "hover":
+            return try service.hover(
+                app: requireString("app", in: arguments),
+                elementIndex: optionalElementIndex(in: arguments),
+                x: optionalDouble("x", in: arguments),
+                y: optionalDouble("y", in: arguments)
             )
         case "type_text":
             return try service.typeText(

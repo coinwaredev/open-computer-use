@@ -71,7 +71,7 @@ public enum ToolDefinitions {
         ),
         ToolDefinition(
             name: "drag",
-            description: "Drag from one point to another using pixel coordinates. By default mouse events are posted directly to the target app and the system pointer does not move; that path cannot drive window-server drag sessions such as window moves, text selection, or Finder drag-and-drop. Those require OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1 in the server process environment, which may move the real pointer. The result reports which path was used. This tool is part of plugin `Computer Use`.",
+            description: "Drag from one point to another using pixel coordinates, with any mouse button. By default the drag goes to the target window through SkyLight: a background window takes it without coming to the front and the system pointer does not move. That covers sliders, canvases, and a right drag that turns a game camera. Window-server drag sessions such as window moves or Finder drag-and-drop need drag_method global, which requires OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1 in the server process environment and may move the real pointer. The result reports which path was used. This tool is part of plugin `Computer Use`.",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
@@ -80,8 +80,31 @@ public enum ToolDefinitions {
                     "from_y": numberProperty(description: "Start Y coordinate"),
                     "to_x": numberProperty(description: "End X coordinate"),
                     "to_y": numberProperty(description: "End Y coordinate"),
+                    "mouse_button": stringProperty(
+                        description: "Mouse button held during the drag. Defaults to left; right turns the camera in many 3D views.",
+                        enumValues: ["left", "right", "middle"]
+                    ),
+                    "duration_ms": numberProperty(description: "How long the move from start to end takes, 0-10000 ms. Defaults to 250. Longer turns a game camera more smoothly; the global and app_post paths ignore it."),
+                    "drag_method": stringProperty(
+                        description: "Delivery: auto (default: sky, then app_post; global when OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1), sky, app_post, or global.",
+                        enumValues: DragMethod.allCases.map(\.rawValue)
+                    ),
                 ],
                 required: ["app", "from_x", "from_y", "to_x", "to_y"]
+            )
+        ),
+        ToolDefinition(
+            name: "hover",
+            description: "Move the pointer over an element or a screenshot point without clicking, so hover styles, hover menus and tooltips show. Goes to the target window through SkyLight: the window does not come to the front and the system pointer does not move. Returns the app state after a short pause; system tooltips take about a second, so read the app again for those. This tool is part of plugin `Computer Use`.",
+            annotations: defaultAnnotations(),
+            inputSchema: objectSchema(
+                properties: [
+                    "app": stringProperty(description: "App name or bundle identifier"),
+                    "element_index": stringProperty(description: "Element to hover over"),
+                    "x": numberProperty(description: "X coordinate in screenshot pixel coordinates"),
+                    "y": numberProperty(description: "Y coordinate in screenshot pixel coordinates"),
+                ],
+                required: ["app"]
             )
         ),
         ToolDefinition(
@@ -201,16 +224,18 @@ public enum ToolDefinitions {
         ),
         ToolDefinition(
             name: "scroll",
-            description: "Scroll an element in a direction by a number of pages. This tool is part of plugin `Computer Use`.",
+            description: "Scroll an element in a direction by a number of pages. Without element_index, scroll at a screenshot point (x/y) or, with neither, at the window's centre: wheel events go to the window through SkyLight without bringing it to the front, for views with no accessibility tree such as game views (the wheel zooms the camera) and canvases. This tool is part of plugin `Computer Use`.",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "direction": stringProperty(description: "Scroll direction: up, down, left, or right"),
                     "element_index": stringProperty(description: "Element identifier"),
+                    "x": numberProperty(description: "X coordinate in screenshot pixel coordinates, when there is no element_index"),
+                    "y": numberProperty(description: "Y coordinate in screenshot pixel coordinates, when there is no element_index"),
                     "pages": numberProperty(description: "Number of pages to scroll. Fractional values are supported. Defaults to 1"),
                 ],
-                required: ["app", "element_index", "direction"]
+                required: ["app", "direction"]
             )
         ),
         ToolDefinition(
