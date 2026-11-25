@@ -74,12 +74,13 @@ enum InputSimulation {
             throw ComputerUseError.message("Failed to create app-post event source.")
         }
 
+        let gap = InputTiming.mouseClickEventGap
         for _ in 0..<max(clickCount, 1) {
-            try postMouseEventToPid(type: .mouseMoved, source: source, point: point, button: button.cgButton, clickState: clickCount, pid: pid)
+            try postMouseEventToPid(type: .mouseMoved, source: source, point: point, button: button.cgButton, clickState: clickCount, pid: pid, gap: gap)
             let release = try mouseRelease(source: source, point: point, button: button, clickState: clickCount)
             try withPressedMouseButton(press: {
-                try postMouseEventToPid(type: button.downEvent, source: source, point: point, button: button.cgButton, clickState: clickCount, pid: pid)
-            }, release: { postPreparedRelease(release, pid: pid) }) {}
+                try postMouseEventToPid(type: button.downEvent, source: source, point: point, button: button.cgButton, clickState: clickCount, pid: pid, gap: gap)
+            }, release: { postPreparedRelease(release, pid: pid, gap: gap) }) {}
         }
     }
 
@@ -157,11 +158,11 @@ enum InputSimulation {
         return event
     }
 
-    private static func postPreparedRelease(_ event: CGEvent, pid: pid_t? = nil) {
+    private static func postPreparedRelease(_ event: CGEvent, pid: pid_t? = nil, gap: TimeInterval = 0.03) {
         // Creation preceded the press; delivery must carry the current time.
         event.timestamp = DispatchTime.now().uptimeNanoseconds
         if let pid { event.postToPid(pid) } else { event.post(tap: .cghidEventTap) }
-        Thread.sleep(forTimeInterval: 0.03)
+        Thread.sleep(forTimeInterval: gap)
     }
 
     static func dragTargeted(from start: CGPoint, to end: CGPoint, pid: pid_t) throws {
@@ -350,7 +351,7 @@ enum InputSimulation {
         return min(max(Int((distance / 4).rounded(.up)), 10), 60)
     }
 
-    private static func postMouseEventToPid(type: CGEventType, source: CGEventSource, point: CGPoint, button: CGMouseButton, clickState: Int, pid: pid_t) throws {
+    private static func postMouseEventToPid(type: CGEventType, source: CGEventSource, point: CGPoint, button: CGMouseButton, clickState: Int, pid: pid_t, gap: TimeInterval = 0.03) throws {
         try requireUsableComputerUseSession()
         guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: button) else {
             throw ComputerUseError.message("Failed to create mouse event \(type.rawValue).")
@@ -358,7 +359,7 @@ enum InputSimulation {
 
         event.setIntegerValueField(.mouseEventClickState, value: Int64(clickState))
         event.postToPid(pid)
-        Thread.sleep(forTimeInterval: 0.03)
+        Thread.sleep(forTimeInterval: gap)
     }
 
     private static func raiseAppWindowViaAccessibility(pid: pid_t) -> Bool {

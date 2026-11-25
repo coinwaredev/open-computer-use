@@ -71,7 +71,15 @@ enum InputTiming {
     /// action call returns once the app has handled it, so the wait only covers the
     /// redraw reaching the window capture: about two display frames. The fixed
     /// 100-150 ms gaps it caps were most of a click's time. Was 150.
+    /// How long type_text watches a field's value after an AXSelectedText write before typing with keys.
+    static let selectedTextApplyWait = milliseconds("OPEN_COMPUTER_USE_SELECTED_TEXT_APPLY_MS", default: 200)
     static let readBackSettle = milliseconds("OPEN_COMPUTER_USE_READ_BACK_SETTLE_MS", default: 40)
+    /// Gap after each pointer event of a pid-posted click (move, press, release).
+    /// A background Cocoa window drops those clicks at any gap, so shorter could not be
+    /// verified; the click fallback now tries sky_click first.
+    static var mouseClickEventGap: TimeInterval {
+        milliseconds("OPEN_COMPUTER_USE_MOUSE_EVENT_GAP_MS", default: 30)
+    }
 }
 
 /// Poll `condition` every `interval` until it holds or `timeout` elapses.

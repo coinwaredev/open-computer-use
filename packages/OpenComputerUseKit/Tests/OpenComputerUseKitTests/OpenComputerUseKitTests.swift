@@ -1189,6 +1189,14 @@ final class OpenComputerUseKitTests: XCTestCase {
         XCTAssertFalse(isSnapshotRootRole(nil))
     }
 
+    func testSelectedTextWriteThatChangesNothingFallsBackToKeys() {
+        // Chrome web fields: the write reports success and the value stays empty.
+        XCTAssertEqual(selectedTextWriteApplied(valueBefore: "", valueAfter: "", selectedBefore: "", text: "sonic"), false)
+        XCTAssertEqual(selectedTextWriteApplied(valueBefore: "hello", valueAfter: "sonichello", selectedBefore: "", text: "sonic"), true)
+        XCTAssertNil(selectedTextWriteApplied(valueBefore: nil, valueAfter: "x", selectedBefore: "", text: "x"), "unreadable value: trust the write")
+        XCTAssertNil(selectedTextWriteApplied(valueBefore: "abc", valueAfter: "abc", selectedBefore: "abc", text: "abc"), "same text over the same selection")
+    }
+
     func testTypeTextReplacementPreservesUTF16SelectionAndCaret() throws {
         let replaced = try XCTUnwrap(typedTextReplacement(value: "中🙂文e\u{301}", selection: CFRange(location: 1, length: 2), text: "新🚀"))
         XCTAssertEqual(replaced.value, "中新🚀文e\u{301}")

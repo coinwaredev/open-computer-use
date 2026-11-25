@@ -890,13 +890,14 @@ public final class ComputerUseService {
                         includeNearbyHitTesting: true,
                         allowActivationFallback: true
                     ) }) {
-                        try performNonAXClickFallback(
+                        try TimingLog.measure("click.event_fallback") { try performNonAXClickFallback(
                             at: targetPoint,
+                            windowPoint: windowPoint,
                             button: button,
                             clickCount: clickCount,
                             targetDescription: "element_index=\(elementIndex)",
                             snapshot: snapshot
-                        )
+                        ) }
                     }
                 case .accessibility:
                     guard try performAXClickSequence(
@@ -964,6 +965,7 @@ public final class ComputerUseService {
                     if !handled {
                         try performNonAXClickFallback(
                             at: targetPoint,
+                            windowPoint: point,
                             button: button,
                             clickCount: clickCount,
                             targetDescription: "x=\(Int(screenshotPoint.x)) y=\(Int(screenshotPoint.y))",
@@ -1836,12 +1838,13 @@ public final class ComputerUseService {
 
             if includeNearbyHitTesting {
                 for localPoint in clickActionPoints(for: record, snapshot: snapshot) {
-                    guard let hitRecord = try hitTestElement(at: localPoint, in: snapshot) ?? bestElement(containing: localPoint, in: snapshot) else {
+                    guard let hitRecord = try TimingLog.measure("click.hit_test", { try hitTestElement(at: localPoint, in: snapshot) ?? bestElement(containing: localPoint, in: snapshot) }) else {
                         continue
                     }
 
+                    debugClickDecision("hit record \(clickDebugDescription(hitRecord))")
                     if !isLikelySyntheticSideAction(hitRecord, in: record),
-                       try performPreferredClick(on: hitRecord, button: button, clickCount: clickCount)
+                       try TimingLog.measure("click.hit_preferred", { try performPreferredClick(on: hitRecord, button: button, clickCount: clickCount) })
                     {
                         debugClickDecision("handled by hit record \(clickDebugDescription(hitRecord))")
                         pauseBeforeReadBack(0.15)
@@ -2248,9 +2251,14 @@ public final class ComputerUseService {
         var caret: Int?
         // SelectedText preserves the selection/caret and rich text. It can be
         // writable even when replacing the entire AXValue is not supported.
+        var selectedTextCheck: (valueBefore: String?, selectedBefore: String?)?
         if isSettable(element: element, attribute: kAXSelectedTextAttribute) {
             attribute = kAXSelectedTextAttribute
             value = text
+            selectedTextCheck = (
+                stringValue(of: element, attribute: kAXValueAttribute),
+                stringValue(of: element, attribute: kAXSelectedTextAttribute)
+            )
         } else {
             let valueWritable = isSettable(element: element, attribute: kAXValueAttribute)
             let rangeWritable = isSettable(element: element, attribute: kAXSelectedTextRangeAttribute)
@@ -2279,6 +2287,24 @@ public final class ComputerUseService {
             // A failed/timed-out write may already have changed the control.
             // Never append or resend the same input through another path.
             throw ComputerUseError.message("type_text AXUIElementSetAttributeValue(\(attribute)) failed with \(result.rawValue). Read the current text before retrying.")
+        }
+        if let check = selectedTextCheck {
+            // Chrome web fields report success for an AXSelectedText write and insert nothing.
+            // Watch the value briefly; an unchanged value means the keyboard path should type it.
+            var applied = selectedTextWriteApplied(valueBefore: check.valueBefore, valueAfter: check.valueBefore, selectedBefore: check.selectedBefore, text: text)
+            let deadline = Date().addingTimeInterval(InputTiming.selectedTextApplyWait)
+            while applied == false {
+                let after = stringValue(of: element, attribute: kAXValueAttribute)
+                applied = selectedTextWriteApplied(valueBefore: check.valueBefore, valueAfter: after, selectedBefore: check.selectedBefore, text: text)
+                if applied != false || Date() >= deadline { break }
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            if applied == false {
+                if inputFallbackDebugEnabled(environment: ProcessInfo.processInfo.environment) {
+                    fputs("[open-computer-use] type_text selected_text write reported success but the value did not change; typing with keys\n", stderr)
+                }
+                return false
+            }
         }
         if let caret {
             try requireCurrentTextFocus(element, pid: pid)
@@ -2719,12 +2745,34 @@ public final class ComputerUseService {
 
     private func performNonAXClickFallback(
         at point: CGPoint,
+        windowPoint: CGPoint,
         button: MouseButtonKind,
         clickCount: Int,
         targetDescription: String,
         snapshot: AppSnapshot
     ) throws {
         let eventPoint = inputEventPoint(fromScreenStatePoint: point)
+
+        // A background Cocoa window drops pid-posted clicks (TextEdit: 0 of 10 landed),
+        // while the SkyLight path makes the window take them without raising it (10 of
+        // 10). Try it first; pid posting stays for what it cannot reach.
+        if button == .left, (1...2).contains(clickCount),
+           let windowBounds = snapshot.windowBounds, let windowID = snapshot.targetWindowID {
+            do {
+                try InputSimulation.clickWithSkyLight(
+                    at: eventPoint,
+                    windowPoint: windowPoint,
+                    windowBounds: windowBounds,
+                    windowID: windowID,
+                    clickCount: clickCount,
+                    pid: snapshot.app.pid
+                )
+                debugClickDecision("fallback executed=skylight_pid_post target=\(targetDescription)")
+                return
+            } catch {
+                debugClickDecision("fallback sky_click unavailable (\(error)); posting to pid target=\(targetDescription)")
+            }
+        }
 
         if globalPointerFallbacksEnabled(environment: ProcessInfo.processInfo.environment) {
             debugInputFallback(
@@ -2813,4 +2861,12 @@ public final class ComputerUseService {
         }
         return ToolCallResult(content: content)
     }
+}
+
+/// Whether an AXSelectedText write visibly took effect. `nil` when it can't be told: the value
+/// is unreadable, or the text replaces an identical selection.
+func selectedTextWriteApplied(valueBefore: String?, valueAfter: String?, selectedBefore: String?, text: String) -> Bool? {
+    guard let before = valueBefore, let after = valueAfter else { return nil }
+    if selectedBefore == text { return nil }
+    return after != before
 }

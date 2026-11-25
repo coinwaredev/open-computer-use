@@ -228,7 +228,7 @@ Windows returns an unsupported error for `sky_click`; Linux returns an unsupport
 
 ## Choosing a Keyboard Method
 
-`key_method` on `type_text` and `press_key` is optional. Omitting it uses `auto`, which keeps the existing accessibility-first typing and app-posted key events. Explicit methods never fall back:
+`key_method` on `type_text` and `press_key` is optional. Omitting it uses `auto`, which keeps the existing accessibility-first typing and app-posted key events. On macOS, `auto` checks that an accessibility text write changed the field: Chrome web fields report success and insert nothing, so after 200 ms with no change (`OPEN_COMPUTER_USE_SELECTED_TEXT_APPLY_MS`) the text is typed as key events instead. Explicit methods never fall back:
 
 - `sky_key`: use the macOS private SkyLight background-window path. It makes the current target window the key window inside its own app (without raising it, moving the pointer, switching Spaces, or deactivating the foreground app), delivers the keys, and releases that state again. Command chords such as `cmd+a`, `cmd+c` or `cmd+v` are performed through the target's own menu bar. Supported on macOS only.
 - `global`: Windows press_key only. Requires `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1` and sends checked physical keys to the verified foreground target. Auto keys keep window-message delivery even when that flag is enabled. It does not apply to type_text.
@@ -351,7 +351,11 @@ travel and click feedback. A glide takes hand speed: about 0.2 s across a window
 actions. After an accessibility action, the read-back waits at most 40 ms for the redraw
 (`OPEN_COMPUTER_USE_READ_BACK_SETTLE_MS`; it was 100-150 ms) and reuses the app it already resolved, and the
 snapshot no longer walks closed menus under the menu bar (their items were never printed). A TextEdit click with
-read-back went from about 350 ms to 140 ms. Window screenshots never include the cursor. A one-shot `open-computer-use call` draws no
+read-back went from about 350 ms to 140 ms. An element with no accessibility press (a scroll bar, a
+custom-drawn view) gets a `sky_click`: plain mouse events posted to the app's process are dropped by
+background Cocoa windows, so that fallback used to report success without clicking. If `sky_click` is
+unavailable it still posts to the process (`OPEN_COMPUTER_USE_MOUSE_EVENT_GAP_MS`, default 30, sets the
+gap between those events). Such a click takes about 190 ms with read-back. Window screenshots never include the cursor. A one-shot `open-computer-use call` draws no
 cursor: it would disappear when the process exits. The MCP server and the app agent draw it.
 Turn end or session cleanup cancels unfinished and queued cursor animations; old animations cannot
 show the cursor again after cleanup.

@@ -348,11 +348,10 @@ final class SkyLightSPI: WindowOcclusionControlling, @unchecked Sendable {
         }
     }
 
+    /// No settle after the deactivate record: no event follows it, and WindowServer
+    /// handles a later activate record in order.
     func endSyntheticTargetFocus(_ context: SkyLightSyntheticFocusContext) throws {
         try postActivationCommand(context.deactivateTarget)
-        if InputTiming.focusRecordSettle > 0 {
-            Thread.sleep(forTimeInterval: InputTiming.focusRecordSettle)
-        }
     }
 
     private func unavailableError() -> ComputerUseError {

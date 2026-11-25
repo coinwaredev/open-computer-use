@@ -24,4 +24,19 @@
 - 光标滑动 250-300 px 用时 180-200 ms（原来约 1.4 s），没有左下角帧。
 - `swift test` 485 个测试全部通过。
 
+## 后续：没有 AX press 的元素
+
+- 滚动条等没有 AX 动作的元素走事件回退：命中测试约 10 ms，然后按 pid 投递鼠标事件，三次固定 30 ms 间隔。
+- 实测（TextEdit 后台窗口，每种 20 次以内）：pid 投递的点击 0/10 落地（间隔 30、10、0 ms 都一样），后台 Cocoa 窗口直接丢弃；`sky_click` 10/10 落地，不抬起窗口。回退原来报告成功但没有点击。
+- 回退现在先试 `sky_click`（左键，1-2 次，有窗口 id 和边界时），失败才走原来的全局或 pid 投递。pid 投递间隔可用 `OPEN_COMPUTER_USE_MOUSE_EVENT_GAP_MS` 调（默认 30）。
+- `sky_click` 结束焦点记录后的 10 ms 等待去掉：之后没有事件，WindowServer 按顺序处理下一次激活记录。为 Chromium 调的间隔（primer、渲染器等待）不动。
+- 结果：TextEdit 后台 `sky_click` 20/20 落地，`service.click` 163 ms 降到 136 ms；Preview 滚动条经 MCP 中位数 191 ms（含 read-back 截图）。`swift test` 486 个测试通过。
+
+## 后续：Chrome 里 type_text 不落字
+
+- 用户在 Chrome 里实测：默认 `type_text` 报告成功，但 Google 搜索框和 Amazon 搜索框都是空的；`press_key` Return 能到达。
+- 原因：Chrome 网页输入框的 AXSelectedText 可写，`AXUIElementSetAttributeValue` 返回成功，但什么都不插入。旧代码只看返回值，于是不走键盘回退。
+- 现在 AXSelectedText 写入后读 AXValue：能读到且写入前后不变（最多等 200 ms，`OPEN_COMPUTER_USE_SELECTED_TEXT_APPLY_MS`）就改用按键事件输入。值读不到，或用同样的文字替换同样的选中内容时，仍按原来的方式信任返回值。
+- 结果：Chrome Amazon 搜索框和新标签页 Google 搜索框默认 `type_text` 都能输入，文字只出现一次；TextEdit 仍走 AX 写入（92 ms，没有回退）。新增单元测试 `testSelectedTextWriteThatChangesNothingFallsBackToKeys` 和实机测试 `TypeTextLiveTests`。`swift test` 488 个测试通过。
+
 由 Claude Code（claude-opus-5-5）实现。
