@@ -47,7 +47,9 @@ struct CursorRestingAnchor: Equatable, Sendable {
 /// cache the last usable frame, and limit requests to 30 Hz. The window list is
 /// used only when no accessibility element was registered; a failed AX read
 /// must not replace a good frame with the window list's stale origin.
-enum CursorWindowFrameTracker {
+/// Live frame of the one window a cursor is anchored to. Each chat's cursor owns one (see
+/// `VisualCursorChannel`), so two cursors anchored to different windows don't evict each other.
+final class CursorWindowFrames: @unchecked Sendable {
     private final class Source: @unchecked Sendable {
         let windowID: CGWindowID
         let element: AXUIElement?
@@ -57,115 +59,123 @@ enum CursorWindowFrameTracker {
         }
     }
 
-    /// Lock-protected box so the tracker can be used from the service thread
-    /// and the overlay's main-thread pump alike.
-    private final class State: @unchecked Sendable {
-        let lock = NSLock()
-        // Only one software cursor is displayed. Do not retain every window
-        // ever observed by a long-lived App Agent.
-        var source: Source?
-        var frame: CGRect?
-        var nextRefresh: TimeInterval = 0
-        var refreshing = false
-        /// Test seam: consulted before any real lookup.
-        var override: ((CGWindowID) -> CGRect?)?
-        var reader: (@Sendable (CGWindowID) -> CGRect?)?
-    }
+    // Lock-protected so the tracker can be used from the service thread and the overlay's
+    // main-thread pump alike. One source per cursor: never retain every window a long-lived
+    // App Agent has seen.
+    private let lock = NSLock()
+    private var source: Source?
+    private var frame: CGRect?
+    private var nextRefresh: TimeInterval = 0
+    private var refreshing = false
+    /// Test seam: consulted before any real lookup.
+    private var override: ((CGWindowID) -> CGRect?)?
+    private var reader: (@Sendable (CGWindowID) -> CGRect?)?
 
-    private static let state = State()
     private static let queue = DispatchQueue(label: "com.ifuryst.ocu.cursor-frame", qos: .userInitiated)
     private static let refreshInterval: TimeInterval = 1 / 30
 
-    static func register(windowID: CGWindowID?, element: AXUIElement?) {
+    func register(windowID: CGWindowID?, element: AXUIElement?) {
         guard let windowID else {
             return
         }
 
-        state.lock.lock()
-        defer { state.lock.unlock() }
-        if let existing = state.source, existing.windowID == windowID {
+        lock.lock()
+        defer { lock.unlock() }
+        if let existing = source, existing.windowID == windowID {
             switch (existing.element, element) {
             case let (lhs?, rhs?) where CFEqual(lhs, rhs): return
             case (nil, nil): return
             default: break
             }
         }
-        state.source = Source(windowID: windowID, element: element)
-        state.frame = nil
-        state.nextRefresh = 0
+        source = Source(windowID: windowID, element: element)
+        frame = nil
+        nextRefresh = 0
     }
 
-    static func forget(windowID: CGWindowID) {
-        state.lock.lock()
-        defer { state.lock.unlock() }
-        if state.source?.windowID == windowID {
-            state.source = nil
-            state.frame = nil
+    func forget(windowID: CGWindowID) {
+        lock.lock()
+        defer { lock.unlock() }
+        if source?.windowID == windowID {
+            source = nil
+            frame = nil
         }
     }
 
-    static func forgetAll() {
-        state.lock.lock()
-        defer { state.lock.unlock() }
-        state.source = nil
-        state.frame = nil
+    func forgetAll() {
+        lock.lock()
+        defer { lock.unlock() }
+        source = nil
+        frame = nil
         // An in-flight IPC read cannot be cancelled safely. Keep its slot busy
         // until it returns; its result will be discarded by source identity.
     }
 
-    static func installFrameOverrideForTesting(_ body: ((CGWindowID) -> CGRect?)?) {
-        state.lock.lock()
-        defer { state.lock.unlock() }
-        state.override = body
+    func installFrameOverrideForTesting(_ body: ((CGWindowID) -> CGRect?)?) {
+        lock.lock()
+        defer { lock.unlock() }
+        override = body
     }
 
-    static func installFrameReaderForTesting(_ body: (@Sendable (CGWindowID) -> CGRect?)?) {
-        state.lock.lock()
-        defer { state.lock.unlock() }
-        state.reader = body
+    func installFrameReaderForTesting(_ body: (@Sendable (CGWindowID) -> CGRect?)?) {
+        lock.lock()
+        defer { lock.unlock() }
+        reader = body
     }
 
-    static func liveFrame(for windowID: CGWindowID) -> CGRect? {
-        state.lock.lock()
-        if let body = state.override {
-            state.lock.unlock()
+    func liveFrame(for windowID: CGWindowID) -> CGRect? {
+        lock.lock()
+        if let body = override {
+            lock.unlock()
             return body(windowID)
         }
-        guard let source = state.source, source.windowID == windowID else {
-            state.lock.unlock()
+        guard let source, source.windowID == windowID else {
+            lock.unlock()
             return nil
         }
-        let frame = state.frame
+        let frame = self.frame
         let now = ProcessInfo.processInfo.systemUptime
-        let refresh = !state.refreshing && now >= state.nextRefresh
-        let reader = state.reader
+        let refresh = !refreshing && now >= nextRefresh
+        let reader = self.reader
         if refresh {
-            state.refreshing = true
-            state.nextRefresh = now + refreshInterval
+            refreshing = true
+            nextRefresh = now + Self.refreshInterval
         }
-        state.lock.unlock()
+        lock.unlock()
         if refresh {
-            queue.async {
+            Self.queue.async { [self] in
                 // Accessibility can block on an unresponsive app. It must not
                 // run on the render thread or accumulate a queue of requests.
                 let observed: CGRect?
                 if let reader { observed = reader(source.windowID) }
-                else if let element = source.element { observed = accessibilityFrame(element) }
-                else { observed = windowListFrame(for: source.windowID) }
-                state.lock.lock()
-                if state.source === source, let observed, CursorRestingAnchor.isUsable(observed) {
-                    state.frame = observed
+                else if let element = source.element { observed = CursorWindowFrameTracker.accessibilityFrame(element) }
+                else { observed = CursorWindowFrameTracker.windowListFrame(for: source.windowID) }
+                lock.lock()
+                if self.source === source, let observed, CursorRestingAnchor.isUsable(observed) {
+                    self.frame = observed
                 }
-                state.refreshing = false
-                state.lock.unlock()
+                refreshing = false
+                lock.unlock()
             }
         }
         return frame
     }
+}
+
+/// The shared default cursor's frames (one-shot CLI, tests), plus the frame readers.
+enum CursorWindowFrameTracker {
+    static let shared = CursorWindowFrames()
+
+    static func register(windowID: CGWindowID?, element: AXUIElement?) { shared.register(windowID: windowID, element: element) }
+    static func forget(windowID: CGWindowID) { shared.forget(windowID: windowID) }
+    static func forgetAll() { shared.forgetAll() }
+    static func installFrameOverrideForTesting(_ body: ((CGWindowID) -> CGRect?)?) { shared.installFrameOverrideForTesting(body) }
+    static func installFrameReaderForTesting(_ body: (@Sendable (CGWindowID) -> CGRect?)?) { shared.installFrameReaderForTesting(body) }
+    static func liveFrame(for windowID: CGWindowID) -> CGRect? { shared.liveFrame(for: windowID) }
 
     /// Frame read from the registered accessibility element, which reflects a
     /// move immediately.
-    private static func accessibilityFrame(_ element: AXUIElement) -> CGRect? {
+    static func accessibilityFrame(_ element: AXUIElement) -> CGRect? {
         var positionValue: CFTypeRef?
         var sizeValue: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &positionValue) == .success,

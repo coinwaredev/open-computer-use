@@ -159,7 +159,11 @@ func inputEventPoint(
 /// The click paths derive their point from the snapshot, so they carry the
 /// window frame that point belongs to; the overlay needs both to follow the
 /// window if it moves before or during the action.
-func makeCursorWindowAnchor(snapshot: AppSnapshot, windowLocalPoint: CGPoint) -> CursorRestingAnchor? {
+func makeCursorWindowAnchor(
+    snapshot: AppSnapshot,
+    windowLocalPoint: CGPoint,
+    cursor: VisualCursorChannel = .shared
+) -> CursorRestingAnchor? {
     guard let windowID = snapshot.targetWindowID, let windowBounds = snapshot.windowBounds else {
         return nil
     }
@@ -170,8 +174,9 @@ func makeCursorWindowAnchor(snapshot: AppSnapshot, windowLocalPoint: CGPoint) ->
     // through the cursor queue so an earlier queued action that clears tracking
     // cannot drop it.
     nonisolated(unsafe) let element = snapshot.windowElement
-    VisualCursorSupport.performOnMain {
-        CursorWindowFrameTracker.register(windowID: windowID, element: element)
+    let frames = cursor.frames
+    cursor.performOnMain {
+        frames.register(windowID: windowID, element: element)
     }
 
     return CursorRestingAnchor(
@@ -718,16 +723,25 @@ public final class ComputerUseService {
 
     public func clearQueryIndexes() { targetedElements.clear() }
 
-    public init() {}
+    /// This session's own cursor (see `VisualCursorChannel`): each MCP session gets its own, in its own colour.
+    public let visualCursor: VisualCursorChannel
+
+    public init(visualCursor: VisualCursorChannel = .makeSession()) {
+        self.visualCursor = visualCursor
+    }
 
     /// An action's result reads the window back, so the app gets a beat to redraw
     /// first. Without read-back nothing is read, so there is no wait.
-    private func pauseBeforeReadBack(_ interval: TimeInterval) {
+    /// `interval` is the gap the action used to wait; `InputTiming.readBackSettle`
+    /// caps it unless `capped` is false (an action that changes windows, such as
+    /// choose_file closing its panel and opening the document).
+    private func pauseBeforeReadBack(_ interval: TimeInterval, capped: Bool = true) {
         guard actionReadBack else {
             return
         }
 
-        Thread.sleep(forTimeInterval: interval)
+        let wait = capped ? min(interval, InputTiming.readBackSettle) : interval
+        TimingLog.measure("read_back.pause") { Thread.sleep(forTimeInterval: wait) }
     }
 
     /// The result an action returns: the after-action snapshot, or a short status
@@ -812,7 +826,7 @@ public final class ComputerUseService {
             clickCount: clickCount
         )
 
-        let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex)
+        let snapshot = try TimingLog.measure("click.snapshot_for_action") { try snapshotForAction(app: query, elementIndex: elementIndex) }
         let button = MouseButtonKind(rawValue: mouseButton.lowercased()) ?? .left
         // 上一次 click 若在附说明前抛错，说明不能带到这一次。
         pendingClickDeliveryNote = nil
@@ -860,7 +874,7 @@ public final class ComputerUseService {
                 at: targetPoint,
                 targetWindowID: snapshot.targetWindowID,
                 targetWindowLayer: snapshot.targetWindowLayer,
-                anchor: makeCursorWindowAnchor(snapshot: snapshot, windowLocalPoint: windowPoint)
+                anchor: makeCursorWindowAnchor(snapshot: snapshot, windowLocalPoint: windowPoint, cursor: visualCursor)
             )
 
             moveVisualCursor(to: cursorTarget)
@@ -868,14 +882,14 @@ public final class ComputerUseService {
             do {
                 switch clickMethod {
                 case .auto:
-                    if !(try performAXClickSequence(
+                    if !(try TimingLog.measure("click.ax_sequence") { try performAXClickSequence(
                         on: record,
                         snapshot: snapshot,
                         button: button,
                         clickCount: clickCount,
                         includeNearbyHitTesting: true,
                         allowActivationFallback: true
-                    )) {
+                    ) }) {
                         try performNonAXClickFallback(
                             at: targetPoint,
                             button: button,
@@ -922,7 +936,7 @@ public final class ComputerUseService {
                 at: targetPoint,
                 targetWindowID: snapshot.targetWindowID,
                 targetWindowLayer: snapshot.targetWindowLayer,
-                anchor: makeCursorWindowAnchor(snapshot: snapshot, windowLocalPoint: point)
+                anchor: makeCursorWindowAnchor(snapshot: snapshot, windowLocalPoint: point, cursor: visualCursor)
             )
 
             moveVisualCursor(to: cursorTarget)
@@ -979,7 +993,7 @@ public final class ComputerUseService {
             throw ComputerUseError.invalidArguments("click requires either element_index or x/y")
         }
 
-        let result = try actionResult(for: query, recoveryPolicy: clickActionSnapshotRecoveryPolicy(for: clickMethod))
+        let result = try TimingLog.measure("click.read_back") { try actionResult(for: query, recoveryPolicy: clickActionSnapshotRecoveryPolicy(for: clickMethod)) }
         guard let note = pendingClickDeliveryNote else { return result }
         pendingClickDeliveryNote = nil
         return appendingResultNote(note, to: result)
@@ -1179,6 +1193,29 @@ public final class ComputerUseService {
 
         try KeySequence.run(resolved, pid: snapshot.app.pid)
         return try actionResult(for: query)
+    }
+
+    /// Picks a file in the app's open Open panel by path, through accessibility only (see FilePanelDriver).
+    public func chooseFile(app query: String, path: String) throws -> ToolCallResult {
+        let snapshot = try currentSnapshot(for: query)
+        if snapshot.mode == .fixture {
+            throw ComputerUseError.message("choose_file is not supported for fixture apps")
+        }
+
+        try requireUsableComputerUseSession()
+        let outcome = try FilePanelDriver(
+            pid: snapshot.app.pid,
+            hintWindows: [snapshot.windowElement].compactMap { $0 },
+            checkSession: { try requireUsableComputerUseSession() }
+        ).choose(path: path)
+
+        var note = "Chose \(outcome.path) in the Open panel (from \(outcome.anchor) in its sidebar)."
+        if outcome.switchedToListView {
+            note += " The panel was switched to list view."
+        }
+        pauseBeforeReadBack(0.3, capped: false)
+        let after = try actionResult(for: query)
+        return ToolCallResult(content: [.text(note)] + after.content, isError: after.isError)
     }
 
     private func requireAutoKeyMethodForFixture(_ keyMethod: KeyMethod) throws {
@@ -1451,7 +1488,7 @@ public final class ComputerUseService {
         recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation,
         observation: SnapshotObservationOptions = .defaults
     ) throws -> AppSnapshot {
-        let app = try AppDiscovery.resolve(query)
+        let app = try TimingLog.measure("snapshot.resolve_app") { try rememberedApp(for: query) ?? AppDiscovery.resolve(query) }
         let snapshot = try SnapshotBuilder.build(
             for: app,
             textLimit: textLimit,
@@ -1462,6 +1499,19 @@ public final class ComputerUseService {
 
         rememberSnapshot(snapshot, for: query)
         return snapshot
+    }
+
+    /// The app this query last resolved to, while it still runs. Resolving again
+    /// lists and sorts every running app over LaunchServices; the read-back after
+    /// each action paid that for an answer it already had.
+    private func rememberedApp(for query: String) -> RunningAppDescriptor? {
+        guard let app = snapshotsByApp[query.lowercased()]?.app,
+              app.name != FixtureBridge.appName,
+              !app.runningApplication.isTerminated
+        else {
+            return nil
+        }
+        return app
     }
 
     func rememberSnapshot(_ snapshot: AppSnapshot, for query: String) {
@@ -1770,13 +1820,13 @@ public final class ComputerUseService {
             canUseActivationOnlyClickFallback(role: stringValue(of: $0, attribute: kAXRoleAttribute))
         } == true
         if !preferContainingWebRowAXClick && !windowIndexClick {
-            if try performPreferredClick(on: record, button: button, clickCount: clickCount) {
+            if try TimingLog.measure("click.preferred", { try performPreferredClick(on: record, button: button, clickCount: clickCount) }) {
                 debugClickDecision("handled by preferred target \(clickDebugDescription(record))")
                 pauseBeforeReadBack(0.15)
                 return true
             }
 
-            for candidate in descendantClickCandidates(for: record, snapshot: snapshot) where isAtTarget(candidate) {
+            for candidate in TimingLog.measure("click.descendants", { descendantClickCandidates(for: record, snapshot: snapshot) }) where isAtTarget(candidate) {
                 if try performPreferredClick(on: candidate, button: button, clickCount: clickCount) {
                     debugClickDecision("handled by descendant \(clickDebugDescription(candidate))")
                     pauseBeforeReadBack(0.15)
@@ -2529,8 +2579,9 @@ public final class ComputerUseService {
         // `makeCursorWindowAnchor`.
         let windowID = snapshot.targetWindowID
         nonisolated(unsafe) let element = snapshot.windowElement
-        VisualCursorSupport.performOnMain {
-            CursorWindowFrameTracker.register(windowID: windowID, element: element)
+        let frames = visualCursor.frames
+        visualCursor.performOnMain {
+            frames.register(windowID: windowID, element: element)
         }
 
         return makeVisualCursorTarget(
@@ -2551,8 +2602,8 @@ public final class ComputerUseService {
             return
         }
 
-        VisualCursorSupport.performOnMain {
-            SoftwareCursorOverlay.moveCursor(to: target.point, in: target.window, anchor: target.anchor)
+        visualCursor.withOverlay { cursor in
+            cursor.moveCursor(to: target.point, in: target.window, anchor: target.anchor)
         }
     }
 
@@ -2561,8 +2612,8 @@ public final class ComputerUseService {
             return
         }
 
-        VisualCursorSupport.performOnMain {
-            SoftwareCursorOverlay.settle(at: target.point, in: target.window, anchor: target.anchor)
+        visualCursor.withOverlay { cursor in
+            cursor.settle(at: target.point, in: target.window, anchor: target.anchor)
         }
     }
 
@@ -2571,8 +2622,8 @@ public final class ComputerUseService {
             return
         }
 
-        VisualCursorSupport.performOnMain {
-            SoftwareCursorOverlay.pulseClick(
+        visualCursor.withOverlay { cursor in
+            cursor.pulseClick(
                 at: target.point,
                 clickCount: clickCount,
                 mouseButton: mouseButton,

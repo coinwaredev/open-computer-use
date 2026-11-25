@@ -67,6 +67,11 @@ enum InputTiming {
         "OPEN_COMPUTER_USE_PRESS_KEY_SETTLE_MS",
         default: pressKeySettleDefaultMilliseconds
     )
+    /// Ceiling on the wait between an accessibility action and its read-back. The
+    /// action call returns once the app has handled it, so the wait only covers the
+    /// redraw reaching the window capture: about two display frames. The fixed
+    /// 100-150 ms gaps it caps were most of a click's time. Was 150.
+    static let readBackSettle = milliseconds("OPEN_COMPUTER_USE_READ_BACK_SETTLE_MS", default: 40)
 }
 
 /// Poll `condition` every `interval` until it holds or `timeout` elapses.

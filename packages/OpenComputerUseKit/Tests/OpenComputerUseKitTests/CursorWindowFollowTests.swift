@@ -140,6 +140,9 @@ final class CursorWindowFollowTests: XCTestCase {
         try withOverlay { _, original in
             let moved = original.offsetBy(dx: 240, dy: 100)
             CursorWindowFrameTracker.installFrameOverrideForTesting { _ in moved }
+            // The official 1.4 s glide: a quick one would end before 0.5 s even unaborted.
+            setenv("OPEN_COMPUTER_USE_CURSOR_MOTION", "classic", 1)
+            defer { unsetenv("OPEN_COMPUTER_USE_CURSOR_MOTION") }
             let start = ProcessInfo.processInfo.systemUptime
             SoftwareCursorOverlay.moveCursor(to: point(original), in: nil, anchor: anchor(original))
             XCTAssertGreaterThan(ProcessInfo.processInfo.systemUptime - start, 0.5)

@@ -188,6 +188,18 @@ public enum ToolDefinitions {
             )
         ),
         ToolDefinition(
+            name: "choose_file",
+            description: "Pick a file in the app's open macOS Open panel by its path, then press Open. Works in the background through accessibility: the panel's file list is drawn by a separate macOS service, so keys (Go to Folder) and clicks never reach it. Open the panel first (for example File > Open or an Import menu item). The walk starts from a place in the panel's sidebar (the disk, Home, Documents, a volume) and opens each folder down to the file; a panel in icon or column view is switched to list view. Hidden files and Save panels are refused. If the app is on another Space or behind a full-screen app, the panel can't load its files. This tool is part of plugin `Computer Use`.",
+            annotations: defaultAnnotations(),
+            inputSchema: objectSchema(
+                properties: [
+                    "app": stringProperty(description: "App name or bundle identifier"),
+                    "path": stringProperty(description: "Absolute path of the file to pick, or one starting with ~/"),
+                ],
+                required: ["app", "path"]
+            )
+        ),
+        ToolDefinition(
             name: "scroll",
             description: "Scroll an element in a direction by a number of pages. This tool is part of plugin `Computer Use`.",
             annotations: defaultAnnotations(),

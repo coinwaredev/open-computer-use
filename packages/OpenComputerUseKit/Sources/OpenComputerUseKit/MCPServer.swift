@@ -133,7 +133,8 @@ public final class StdioMCPServer {
     /// instead of the stdio `run()` loop.
     public func endSession() {
         service.clearQueryIndexes()
-        VisualCursorSupport.resetOnMain()
+        // Only this session's cursor: other chats keep theirs.
+        service.visualCursor.resetOnMain()
         backgroundStateReset()
     }
 

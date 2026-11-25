@@ -125,23 +125,26 @@ enum AppDiscovery {
     }
 
     static func runningApps() -> [RunningAppDescriptor] {
+        // Each NSRunningApplication property is a LaunchServices round trip; read
+        // them once per app, not once per sort comparison.
         NSWorkspace.shared.runningApplications
             .filter { !$0.isTerminated }
+            .map { app in
+                (isActive: app.isActive, descriptor: RunningAppDescriptor(
+                    name: appName(app),
+                    bundleIdentifier: app.bundleIdentifier,
+                    pid: app.processIdentifier,
+                    runningApplication: app
+                ))
+            }
             .sorted { lhs, rhs in
                 if lhs.isActive != rhs.isActive {
                     return lhs.isActive && !rhs.isActive
                 }
 
-                return appName(lhs).localizedCaseInsensitiveCompare(appName(rhs)) == .orderedAscending
+                return lhs.descriptor.name.localizedCaseInsensitiveCompare(rhs.descriptor.name) == .orderedAscending
             }
-            .map { app in
-                RunningAppDescriptor(
-                    name: appName(app),
-                    bundleIdentifier: app.bundleIdentifier,
-                    pid: app.processIdentifier,
-                    runningApplication: app
-                )
-            }
+            .map(\.descriptor)
     }
 
     static func resolveRunning(_ query: String, applications: [RunningAppDescriptor]? = nil) throws -> RunningAppDescriptor {
@@ -197,10 +200,14 @@ enum AppDiscovery {
             !AppSafetyPolicy.isBlocked(bundleIdentifier: descriptor.bundleIdentifier)
         }
         let candidates = allowed.map { descriptor in
-            ResolutionCandidate(
+            let executableName = descriptor.runningApplication.executableURL?.deletingPathExtension().lastPathComponent
+            let matches = descriptor.name.caseInsensitiveCompare(query) == .orderedSame
+                || executableName?.caseInsensitiveCompare(query) == .orderedSame
+            // Only a matching app's activation policy affects its rank; skip the round trip for the rest.
+            return ResolutionCandidate(
                 name: descriptor.name,
-                executableName: descriptor.runningApplication.executableURL?.deletingPathExtension().lastPathComponent,
-                isRegularApp: descriptor.runningApplication.activationPolicy == .regular
+                executableName: executableName,
+                isRegularApp: matches && descriptor.runningApplication.activationPolicy == .regular
             )
         }
 

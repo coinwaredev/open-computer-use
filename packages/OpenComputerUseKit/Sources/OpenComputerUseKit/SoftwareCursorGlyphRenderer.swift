@@ -50,6 +50,9 @@ enum SoftwareCursorGlyphMetrics {
     static let pointerArtworkRotation = -(targetNeutralHeading - proceduralContourNeutralHeading)
 }
 
+/// How strongly a chat's colour covers the cursor artwork.
+let visualCursorTintStrength: CGFloat = 0.62
+
 private enum SoftwareCursorGlyphColors {
     static let pointerFill = NSColor(calibratedRed: 0.38, green: 0.36, blue: 0.35, alpha: 0.98)
     static let pointerStroke = NSColor(calibratedWhite: 0.90, alpha: 0.92)
@@ -61,7 +64,8 @@ enum SoftwareCursorGlyphRenderer {
     static func draw(
         in bounds: CGRect,
         context: CGContext,
-        state: SoftwareCursorGlyphRenderState
+        state: SoftwareCursorGlyphRenderState,
+        tint: NSColor? = nil
     ) {
         let drawingState = state.appKitDrawingState
 
@@ -70,7 +74,8 @@ enum SoftwareCursorGlyphRenderer {
                 referenceImage,
                 in: bounds,
                 context: context,
-                state: drawingState
+                state: drawingState,
+                tint: tint
             )
             return
         }
@@ -98,7 +103,8 @@ enum SoftwareCursorGlyphRenderer {
             rotation: drawingState.rotation,
             clickProgress: pulse,
             cursorBodyOffset: drawingState.cursorBodyOffset,
-            boundsMidpoint: CGPoint(x: bounds.midX, y: bounds.midY)
+            boundsMidpoint: CGPoint(x: bounds.midX, y: bounds.midY),
+            tint: tint
         )
     }
 
@@ -106,7 +112,8 @@ enum SoftwareCursorGlyphRenderer {
         _ image: NSImage,
         in bounds: CGRect,
         context: CGContext,
-        state: SoftwareCursorGlyphRenderState
+        state: SoftwareCursorGlyphRenderState,
+        tint: NSColor?
     ) {
         let motionCompression = min(hypot(state.cursorBodyOffset.dx, state.cursorBodyOffset.dy) * 0.008, 0.018)
         let pulseCompression = state.clickProgress * 0.03
@@ -124,6 +131,12 @@ enum SoftwareCursorGlyphRenderer {
         )
         context.translateBy(x: -bounds.midX, y: -bounds.midY)
         image.draw(in: bounds, from: .zero, operation: .sourceOver, fraction: 1)
+        if let tint {
+            // Colour only what the artwork drew (pointer and its glow), keeping its shading.
+            context.setBlendMode(.sourceAtop)
+            context.setFillColor(tint.withAlphaComponent(visualCursorTintStrength).cgColor)
+            context.fill(bounds)
+        }
         context.restoreGState()
     }
 
@@ -189,7 +202,8 @@ enum SoftwareCursorGlyphRenderer {
         rotation: CGFloat,
         clickProgress: CGFloat,
         cursorBodyOffset: CGVector,
-        boundsMidpoint: CGPoint
+        boundsMidpoint: CGPoint,
+        tint: NSColor?
     ) {
         let pointerRect = CGRect(
             x: center.x - (SoftwareCursorGlyphMetrics.pointerSize.width / 2),
@@ -224,7 +238,8 @@ enum SoftwareCursorGlyphRenderer {
         outerPath.fill()
         NSGraphicsContext.restoreGraphicsState()
 
-        SoftwareCursorGlyphColors.pointerFill.setFill()
+        (tint.flatMap { SoftwareCursorGlyphColors.pointerFill.blended(withFraction: visualCursorTintStrength, of: $0) }
+            ?? SoftwareCursorGlyphColors.pointerFill).setFill()
         outerPath.fill()
 
         SoftwareCursorGlyphColors.pointerStroke.setStroke()

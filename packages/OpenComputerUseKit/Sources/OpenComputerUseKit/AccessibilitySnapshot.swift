@@ -200,19 +200,19 @@ enum SnapshotBuilder {
             return buildFixtureSnapshot(app: app, state: fixtureState, observation: observation)
         }
 
-        try requireUsableComputerUseSession()
+        try TimingLog.measure("snapshot.session_check") { try requireUsableComputerUseSession() }
 
-        let permissions = PermissionDiagnostics.current()
+        let permissions = TimingLog.measure("snapshot.permissions") { PermissionDiagnostics.current() }
         guard permissions.accessibilityTrusted else {
             throw ComputerUseError.permissionDenied("Accessibility permission is required. Run `open-computer-use doctor` and grant access to Open Computer Use.")
         }
 
         let appElement = AXUIElementCreateApplication(app.pid)
-        let lazyWebAccessibility = observation.includeAX && (enableBestEffortAccessibilityModes(appElement)
-            || appHasLazyWebAccessibility(bundleURL: app.runningApplication.bundleURL))
+        let lazyWebAccessibility = TimingLog.measure("snapshot.web_modes") { observation.includeAX && (enableBestEffortAccessibilityModes(appElement)
+            || appHasLazyWebAccessibility(bundleURL: app.runningApplication.bundleURL)) }
         let systemWide = AXUIElementCreateSystemWide()
-        var focusedApplication = copyElement(systemWide, attribute: kAXFocusedApplicationAttribute)
-        var focusedWindow = preferredFocusedWindow(appElement: appElement, appPID: app.pid, focusedApplication: focusedApplication, systemWide: systemWide)
+        var focusedApplication = TimingLog.measure("snapshot.focused_app") { copyElement(systemWide, attribute: kAXFocusedApplicationAttribute) }
+        var focusedWindow = TimingLog.measure("snapshot.focused_window") { preferredFocusedWindow(appElement: appElement, appPID: app.pid, focusedApplication: focusedApplication, systemWide: systemWide) }
         if focusedWindow == nil,
            recoveryPolicy == .allowActivation,
            recoverVisibleWindow(for: app, appElement: appElement, preferredWindow: nil) {
@@ -279,7 +279,7 @@ enum SnapshotBuilder {
         observation: SnapshotObservationOptions
     ) -> AppSnapshot {
         let windowBounds = windowCapture.bounds
-        let screenshot = observation.includeScreenshot ? windowCapture.screenshotResult()
+        let screenshot = observation.includeScreenshot ? TimingLog.measure("snapshot.screenshot_total") { windowCapture.screenshotResult() }
             : ScreenshotEncodingResult(data: nil, note: SnapshotObservationOptions.screenshotOmittedNote)
         let screenshotData = screenshot.data
         guard observation.includeAX else {
@@ -290,8 +290,8 @@ enum SnapshotBuilder {
                                windowElement: rootElement, elements: [:], screenshotNote: screenshot.note,
                                observation: observation)
         }
-        let focusedElement = preferredFocusedElement(appElement: appElement, appPID: app.pid, focusedApplication: focusedApplication, systemWide: systemWide)
-        let selectedText = focusedElement.flatMap { copySelectedText($0, textLimit: textLimit) }
+        let focusedElement = TimingLog.measure("snapshot.focused_element") { preferredFocusedElement(appElement: appElement, appPID: app.pid, focusedApplication: focusedApplication, systemWide: systemWide) }
+        let selectedText = TimingLog.measure("snapshot.selected_text") { focusedElement.flatMap { copySelectedText($0, textLimit: textLimit) } }
         let context = RenderContext(
             windowBounds: windowBounds,
             focusedElement: focusedElement,
@@ -305,7 +305,7 @@ enum SnapshotBuilder {
         // Pin the window's visible state (WindowServer occlusion notifications
         // off) so covering it or moving it to another Space later does not hide
         // its content. Only possible while it is currently unoccluded.
-        let pinned = WindowOcclusionKeepAlive.shared.keepVisible(windowID: windowCapture.windowID, bounds: windowBounds)
+        let pinned = TimingLog.measure("snapshot.keep_visible") { WindowOcclusionKeepAlive.shared.keepVisible(windowID: windowCapture.windowID, bounds: windowBounds) }
 
         // Engines that accept AXManualAccessibility build their web tree lazily
         // and drop it while hidden. Re-walk briefly while the window is visible;
@@ -333,7 +333,7 @@ enum SnapshotBuilder {
         if let menuBar = copyElement(appElement, attribute: kAXMenuBarAttribute),
            !CFEqual(menuBar, rootElement)
         {
-            AXSnapshotReadCache.withSnapshot { renderer.render(menuBar) }
+            TimingLog.measure("snapshot.menu_bar") { AXSnapshotReadCache.withSnapshot { renderer.render(menuBar) } }
         }
 
         var treeLines = renderer.lines
@@ -770,8 +770,8 @@ func encodeScreenshot(for image: CGImage, config: ImageCaptureConfig) -> Screens
     if isTiny(width, height) {
         return omitted("resizing would fall below discardBelowPixelCount \(config.discardBelowPixelCount)")
     }
-    guard let resized = scale == 1 ? image : resizedCGImage(image, scale: scale),
-          let data = encode(resized) else { return omitted("\(config.format) encoding failed") }
+    guard let resized = TimingLog.measure("snapshot.resize", { scale == 1 ? image : resizedCGImage(image, scale: scale) }),
+          let data = TimingLog.measure("snapshot.encode_\(config.format)", { encode(resized) }) else { return omitted("\(config.format) encoding failed") }
     return .init(data: data, note: nil)
 }
 
@@ -941,6 +941,12 @@ private struct TreeRenderer {
             var viewport = work.viewport
             if role == "AXScrollArea", let frame = resolveLocalFrame(of: work.node, windowBounds: nil), frame.width > 0, frame.height > 0 {
                 viewport = viewport.map { $0.intersection(frame) } ?? frame
+            }
+            // A menu bar item always renders without its children (`shouldSuppressChildren`), so
+            // walking its closed menu only cost provider reads: about 150 ms per TextEdit snapshot.
+            guard role != kAXMenuBarItemRole as String else {
+                plannedChildren[key] = []
+                continue
             }
             let remaining = work.depth + 1 >= context.treeLimits.maxDepth ? 0 : max(0, scanLimit - scanned)
             let raw = rawChildren(of: work.node, limit: remaining, truncated: &truncated)

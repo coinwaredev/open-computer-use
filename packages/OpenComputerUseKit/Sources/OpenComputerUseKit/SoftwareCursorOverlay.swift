@@ -3,45 +3,98 @@ import CoreGraphics
 import Foundation
 import QuartzCore
 
+/// Static entry points for the shared default cursor (one-shot CLI, tests). A chat's MCP session
+/// draws its own cursor through its own `VisualCursorChannel`.
 public enum VisualCursorSupport {
-    private final class QueueState: @unchecked Sendable {
-        let lock = NSLock()
-        var generation: UInt64 = 0
+    static var generation: UInt64 { VisualCursorChannel.shared.generation }
+
+    static func isCurrent(_ generation: UInt64) -> Bool { VisualCursorChannel.shared.isCurrent(generation) }
+
+    static func invalidatePending() { VisualCursorChannel.shared.invalidatePending() }
+
+    static func resetOnMain() { VisualCursorChannel.shared.resetOnMain() }
+
+    public static var isEnabled: Bool {
+        visualCursorEnabled(environment: ProcessInfo.processInfo.environment)
     }
-    private static let queueState = QueueState()
 
-    static var generation: UInt64 {
-        queueState.lock.lock(); defer { queueState.lock.unlock() }
-        return queueState.generation
+    static func performOnMain(_ body: @escaping @MainActor () -> Void) {
+        VisualCursorChannel.shared.performOnMain(body)
+    }
+}
+
+/// One chat's cursor. Every MCP session in the App Agent gets its own, so chats running side by
+/// side each draw their own pointer, in their own colour, and ending or resetting one chat leaves
+/// the others alone. Upstream had one process-wide cursor: two chats flew it back and forth
+/// between their targets, and any session end hid it for everyone.
+public final class VisualCursorChannel: @unchecked Sendable {
+    /// The default cursor: original colours, used by the one-shot CLI and tests.
+    public static let shared = VisualCursorChannel(isSession: false, frames: CursorWindowFrameTracker.shared)
+
+    let frames: CursorWindowFrames
+    /// A session cursor takes the next colour when it is first drawn, so services that never draw
+    /// (list_apps, a CLI snapshot) don't use one up.
+    private let isSession: Bool
+    private let lock = NSLock()
+    private var generationValue: UInt64 = 0
+    /// Main thread only.
+    nonisolated(unsafe) private var overlayStorage: VisualCursor?
+
+    init(isSession: Bool, frames: CursorWindowFrames = CursorWindowFrames()) {
+        self.isSession = isSession
+        self.frames = frames
+        Self.registry.add(self)
     }
 
-    static func isCurrent(_ generation: UInt64) -> Bool { self.generation == generation }
+    /// A new chat's cursor, tinted with the next colour in `visualCursorSessionTints`.
+    public static func makeSession() -> VisualCursorChannel {
+        VisualCursorChannel(isSession: true)
+    }
 
-    static func invalidatePending() {
-        queueState.lock.lock(); defer { queueState.lock.unlock() }
-        queueState.generation &+= 1
+    deinit {
+        nonisolated(unsafe) let overlay = overlayStorage
+        guard overlay != nil else { return }
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated { overlay?.teardown() }
+        }
+    }
+
+    @MainActor var overlay: VisualCursor {
+        if let overlayStorage { return overlayStorage }
+        let tint = isSession ? visualCursorSessionTint(index: Self.registry.nextSessionIndex()) : nil
+        let overlay = VisualCursor(channel: self, tint: tint)
+        overlayStorage = overlay
+        return overlay
+    }
+
+    var generation: UInt64 {
+        lock.lock(); defer { lock.unlock() }
+        return generationValue
+    }
+
+    func isCurrent(_ generation: UInt64) -> Bool { self.generation == generation }
+
+    func invalidatePending() {
+        lock.lock(); defer { lock.unlock() }
+        generationValue &+= 1
     }
 
     /// Invalidate queued work immediately, including the currently playing
     /// animation. Enqueue cleanup before any work from the next generation.
-    static func resetOnMain() {
-        queueState.lock.lock()
-        queueState.generation &+= 1
+    func resetOnMain() {
+        lock.lock()
+        generationValue &+= 1
         if Thread.isMainThread {
-            queueState.lock.unlock()
-            MainActor.assumeIsolated { SoftwareCursorOverlay.reset(invalidatePending: false) }
+            lock.unlock()
+            MainActor.assumeIsolated { overlayStorage?.reset(invalidatePending: false) }
         } else {
-            let generation = queueState.generation
-            DispatchQueue.main.async {
+            let generation = generationValue
+            DispatchQueue.main.async { [self] in
                 guard isCurrent(generation) else { return }
-                MainActor.assumeIsolated { SoftwareCursorOverlay.reset(invalidatePending: false) }
+                MainActor.assumeIsolated { overlayStorage?.reset(invalidatePending: false) }
             }
-            queueState.lock.unlock()
+            lock.unlock()
         }
-    }
-
-    public static var isEnabled: Bool {
-        visualCursorEnabled(environment: ProcessInfo.processInfo.environment)
     }
 
     /// Cursor animations are cosmetic, so an off-main caller (a tool call) does
@@ -50,7 +103,7 @@ public enum VisualCursorSupport {
     /// one. A backlog reaches `adaptiveCursorTempo` as a zero gap, so the cursor
     /// speeds up to catch up. A main-thread caller plays inline; the one-shot
     /// CLI, which calls on the main thread, draws nothing (`canPresentOverlay`).
-    static func performOnMain(_ body: @escaping @MainActor () -> Void) {
+    func performOnMain(_ body: @escaping @MainActor () -> Void) {
         if Thread.isMainThread {
             MainActor.assumeIsolated {
                 body()
@@ -58,14 +111,86 @@ public enum VisualCursorSupport {
             return
         }
 
-        queueState.lock.lock()
-        let generation = queueState.generation
-        DispatchQueue.main.async {
+        lock.lock()
+        let generation = generationValue
+        DispatchQueue.main.async { [self] in
             guard isCurrent(generation) else { return }
             MainActor.assumeIsolated { body() }
         }
-        queueState.lock.unlock()
+        lock.unlock()
     }
+
+    /// `performOnMain` with this channel's overlay. A main-thread caller plays inline.
+    /// Off-main work (a tool call) joins this cursor's own queue, which animates on the
+    /// cursor's frame timer instead of holding the main queue, so one chat's glide never
+    /// stalls another chat's cursor.
+    func withOverlay(_ body: @escaping @MainActor (VisualCursor) -> Void) {
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { body(overlay) }
+            return
+        }
+
+        lock.lock()
+        let generation = generationValue
+        DispatchQueue.main.async { [self] in
+            guard isCurrent(generation) else { return }
+            MainActor.assumeIsolated {
+                let cursor = overlay
+                cursor.enqueue { [weak self] in
+                    guard self?.isCurrent(generation) == true else { return }
+                    body(cursor)
+                }
+            }
+        }
+        lock.unlock()
+    }
+
+    /// Every live cursor, for a host turn-ended notification, which names no session.
+    static func resetAllOnMain() {
+        for channel in registry.live() {
+            channel.resetOnMain()
+        }
+    }
+
+    private static let registry = Registry()
+
+    private final class Registry: @unchecked Sendable {
+        private final class WeakChannel { weak var channel: VisualCursorChannel?; init(_ channel: VisualCursorChannel) { self.channel = channel } }
+        private let lock = NSLock()
+        private var channels: [WeakChannel] = []
+        private var sessions = 0
+
+        func add(_ channel: VisualCursorChannel) {
+            lock.lock(); defer { lock.unlock() }
+            channels.removeAll { $0.channel == nil }
+            channels.append(WeakChannel(channel))
+        }
+
+        func live() -> [VisualCursorChannel] {
+            lock.lock(); defer { lock.unlock() }
+            return channels.compactMap(\.channel)
+        }
+
+        func nextSessionIndex() -> Int {
+            lock.lock(); defer { lock.unlock() }
+            sessions += 1
+            return sessions - 1
+        }
+    }
+}
+
+/// Session cursor colours, in the order chats connect; they repeat after the last.
+let visualCursorSessionTints: [NSColor] = [
+    NSColor(calibratedRed: 0.20, green: 0.48, blue: 0.96, alpha: 1), // blue
+    NSColor(calibratedRed: 0.96, green: 0.52, blue: 0.12, alpha: 1), // orange
+    NSColor(calibratedRed: 0.16, green: 0.70, blue: 0.36, alpha: 1), // green
+    NSColor(calibratedRed: 0.90, green: 0.26, blue: 0.58, alpha: 1), // pink
+    NSColor(calibratedRed: 0.56, green: 0.38, blue: 0.94, alpha: 1), // purple
+    NSColor(calibratedRed: 0.06, green: 0.66, blue: 0.72, alpha: 1), // teal
+]
+
+func visualCursorSessionTint(index: Int) -> NSColor {
+    visualCursorSessionTints[((index % visualCursorSessionTints.count) + visualCursorSessionTints.count) % visualCursorSessionTints.count]
 }
 
 func visualCursorEnabled(environment: [String: String]) -> Bool {
@@ -138,6 +263,33 @@ func adaptiveCursorTempo(previous: Double, gap: TimeInterval, relaxedGap: TimeIn
     let recovered = previous + (1 - previous) * calm
     return max(min(floor, 1), recovered * (0.6 + 0.4 * calm))
 }
+
+/// How long a glide takes before the burst tempo: a quick flick like a hand on a mouse,
+/// growing with the log of the distance (Fitts), about 0.2 s across a toolbar and 0.35 s
+/// across a screen, never more than 0.4 s. The recovered official timing played every
+/// glide over the full spring time (1.4 s), and a chat that pauses to think between
+/// actions never sped it up, so the cursor reached each target long after the click.
+/// OPEN_COMPUTER_USE_CURSOR_MOTION=classic keeps the official timing.
+func visualCursorTravelDuration(
+    distance: CGFloat,
+    calibrated: CGFloat,
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) -> CGFloat {
+    if environment["OPEN_COMPUTER_USE_CURSOR_MOTION"]?.lowercased() == "classic" {
+        return calibrated
+    }
+    let flick = 0.1 + 0.055 * log2(1 + max(distance, 0) / 30)
+    return min(calibrated, min(max(flick, 0.12), 0.4))
+}
+
+/// Unit tests drive real cursor windows, some to the screen origin (the bottom-left
+/// corner), on whatever screen runs them. Draw them blank there so a test run never
+/// looks like a chat's cursor jumping around; OCU_TEST_SHOW_CURSOR=1 draws them.
+let visualCursorBlankInTests = NSClassFromString("XCTestCase") != nil
+    && ProcessInfo.processInfo.environment["OCU_TEST_SHOW_CURSOR"] != "1"
+
+/// One click's press-and-release on the cursor. Was 0.16 s.
+let visualCursorClickPulseDuration: TimeInterval = 0.1
 
 func visualCursorPostInteractionIdleTimeout() -> TimeInterval {
     30
@@ -214,8 +366,9 @@ public func postOpenComputerUseTurnEndedNotification() {
     )
 }
 
+/// Resets every chat's cursor: the host's turn-ended notification doesn't say which chat it was.
 public func resetOpenComputerUseVisualCursor() {
-    VisualCursorSupport.resetOnMain()
+    VisualCursorChannel.resetAllOnMain()
 }
 
 struct CursorTargetWindow: Equatable, Sendable {
@@ -252,32 +405,161 @@ private struct CursorArtwork {
     )
 }
 
+/// The static API drives the shared default cursor; see `VisualCursorChannel`.
 @MainActor
 enum SoftwareCursorOverlay {
-    private static let artwork = CursorArtwork.active
-    private static let renderBaseHeading = visualCursorRenderBaseHeading()
-    private static let renderYAxisMultiplier = visualCursorRuntimeRenderYAxisMultiplier()
-    private static var panel: CursorPanel?
-    private static var cursorView: SoftwareCursorView?
-    private static var restingTipPosition: CGPoint?
+    static var shared: VisualCursor { VisualCursorChannel.shared.overlay }
+
+    static func moveCursor(to targetPoint: CGPoint, in targetWindow: CursorTargetWindow?, anchor: CursorRestingAnchor? = nil) {
+        shared.moveCursor(to: targetPoint, in: targetWindow, anchor: anchor)
+    }
+
+    static func pulseClick(at targetPoint: CGPoint, clickCount: Int, mouseButton: MouseButtonKind, in targetWindow: CursorTargetWindow?, anchor: CursorRestingAnchor? = nil) {
+        shared.pulseClick(at: targetPoint, clickCount: clickCount, mouseButton: mouseButton, in: targetWindow, anchor: anchor)
+    }
+
+    static func settle(at targetPoint: CGPoint, in targetWindow: CursorTargetWindow?, anchor: CursorRestingAnchor? = nil) {
+        shared.settle(at: targetPoint, in: targetWindow, anchor: anchor)
+    }
+
+    static func reset(invalidatePending: Bool = true) {
+        shared.reset(invalidatePending: invalidatePending)
+    }
+}
+
+/// One cursor on screen: its window, position, motion and timers.
+@MainActor
+final class VisualCursor {
+    private weak var channel: VisualCursorChannel?
+    private let frames: CursorWindowFrames
+    private let tint: NSColor?
+
+    init(channel: VisualCursorChannel, tint: NSColor?) {
+        self.channel = channel
+        frames = channel.frames
+        self.tint = tint
+    }
+
+    private var currentGeneration: UInt64 { channel?.generation ?? 0 }
+
+    /// Queued work belongs to the generation it was queued in; a channel that is gone has no current work.
+    private func isCurrent(_ generation: UInt64) -> Bool { channel?.isCurrent(generation) ?? false }
+
+    var tipPositionForTesting: CGPoint? { displayedTipPosition }
+    var isOnScreenForTesting: Bool { panel?.isVisible ?? false }
+    var tintForTesting: NSColor? { tint }
+
+    /// The chat is gone: take the cursor off screen and stop its timers.
+    func teardown() {
+        cancelQueuedWork()
+        stopIdleAnimation()
+        cancelPendingHide()
+        panel?.orderOut(nil)
+        panel = nil
+        cursorView = nil
+    }
+
+    // Queued chat work (see `VisualCursorChannel.withOverlay`). A job runs once the
+    // previous one's animation ends; animations step on `frameTimer`, so the main
+    // queue stays free for other cursors.
+    private var pendingJobs: [() -> Void] = []
+    private var activeLoop: (step: () -> Bool, finish: () -> Void)?
+    private var frameTimer: Timer?
+    private var runningQueuedJob = false
+
+    func enqueue(_ job: @escaping () -> Void) {
+        pendingJobs.append(job)
+        drainJobs()
+    }
+
+    var hasQueuedWorkForTesting: Bool { activeLoop != nil || !pendingJobs.isEmpty }
+
+    private func drainJobs() {
+        while activeLoop == nil, !runningQueuedJob, !pendingJobs.isEmpty {
+            runQueued(pendingJobs.removeFirst())
+        }
+    }
+
+    private func runQueued(_ body: () -> Void) {
+        runningQueuedJob = true
+        defer { runningQueuedJob = false }
+        body()
+    }
+
+    /// Plays a frame loop; `step` draws one frame and returns true while more follow.
+    /// Inline for a main-thread caller, on this cursor's frame timer for queued work.
+    private func play(_ step: @escaping () -> Bool, then finish: @escaping () -> Void) {
+        guard runningQueuedJob else {
+            while step() {
+                pumpFrame()
+            }
+            finish()
+            return
+        }
+
+        guard step() else {
+            finish()
+            return
+        }
+        activeLoop = (step, finish)
+        guard frameTimer == nil else { return }
+        let timer = Timer(timeInterval: 1 / 120, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.frameTick()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        frameTimer = timer
+    }
+
+    private func frameTick() {
+        guard let loop = activeLoop else {
+            stopFrameTimer()
+            drainJobs()
+            return
+        }
+        if loop.step() { return }
+        activeLoop = nil
+        runQueued(loop.finish)
+        if activeLoop == nil { stopFrameTimer() }
+        drainJobs()
+    }
+
+    private func stopFrameTimer() {
+        frameTimer?.invalidate()
+        frameTimer = nil
+    }
+
+    private func cancelQueuedWork() {
+        pendingJobs.removeAll()
+        activeLoop = nil
+        stopFrameTimer()
+    }
+
+    private let artwork = CursorArtwork.active
+    private let renderBaseHeading = visualCursorRenderBaseHeading()
+    private let renderYAxisMultiplier = visualCursorRuntimeRenderYAxisMultiplier()
+    private var panel: CursorPanel?
+    private var cursorView: SoftwareCursorView?
+    private var restingTipPosition: CGPoint?
     /// Survives hide and session reset so the next fresh move starts where the cursor was last seen.
-    private static var lastSeenTipPosition: CGPoint?
-    private static var displayedTipPosition: CGPoint?
-    private static var activeTargetWindow: CursorTargetWindow?
+    private var lastSeenTipPosition: CGPoint?
+    private var displayedTipPosition: CGPoint?
+    private var activeTargetWindow: CursorTargetWindow?
     /// Window frame the current target point was derived from; lets a move
     /// under the cursor be detected and re-derived instead of ignored.
-    private static var restingAnchor: CursorRestingAnchor?
-    private static var lastAnchorFrame: CGRect?
-    private static var visualDynamicsState: CursorVisualDynamicsState?
-    private static var idleTimer: Timer?
-    private static var hideTimer: Timer?
-    private static var idlePhase: CGFloat = 0
-    private static var idleTicks = 0
-    private static var observationPhase = "hidden"
-    private static var tempo: Double = 1
-    private static var lastInteractionEnd: CFTimeInterval?
+    private var restingAnchor: CursorRestingAnchor?
+    private var lastAnchorFrame: CGRect?
+    private var visualDynamicsState: CursorVisualDynamicsState?
+    private var idleTimer: Timer?
+    private var hideTimer: Timer?
+    private var idlePhase: CGFloat = 0
+    private var idleTicks = 0
+    private var observationPhase = "hidden"
+    private var tempo: Double = 1
+    private var lastInteractionEnd: CFTimeInterval?
 
-    static func moveCursor(
+    func moveCursor(
         to targetPoint: CGPoint,
         in targetWindow: CursorTargetWindow?,
         anchor: CursorRestingAnchor? = nil
@@ -286,14 +568,14 @@ enum SoftwareCursorOverlay {
             return
         }
 
-        let generation = VisualCursorSupport.generation
+        let generation = currentGeneration
         prepareWindowIfNeeded()
         stopIdleAnimation()
         cancelPendingHide()
         configureOrdering(relativeTo: targetWindow)
 
         adoptAnchor(anchor)
-        lastAnchorFrame = anchor.flatMap { CursorWindowFrameTracker.liveFrame(for: $0.windowID) } ?? anchor?.windowBounds
+        lastAnchorFrame = anchor.flatMap { frames.liveFrame(for: $0.windowID) } ?? anchor?.windowBounds
         let constrainedTarget = clampTipPosition(liveTargetPoint(targetPoint, anchor: anchor))
         let isFreshStart = displayedTipPosition == nil
         let startPoint = displayedTipPosition ?? visualCursorFreshStartTipPosition(
@@ -307,7 +589,10 @@ enum SoftwareCursorOverlay {
             gap: lastInteractionEnd.map { now - $0 } ?? .infinity,
             floor: burstTempoFloor
         )
-        defer { if VisualCursorSupport.isCurrent(generation) { lastInteractionEnd = CACurrentMediaTime() } }
+        let finish = { [weak self] in
+            guard let self, self.isCurrent(generation) else { return }
+            self.lastInteractionEnd = CACurrentMediaTime()
+        }
 
         observationPhase = "moving"
         panel?.alphaValue = 1
@@ -326,11 +611,13 @@ enum SoftwareCursorOverlay {
         }
 
         if distanceBetween(startPoint, constrainedTarget) > 2 {
-            animateMove(from: startPoint, to: constrainedTarget, relativeTo: targetWindow, generation: generation)
+            play(moveLoop(from: startPoint, to: constrainedTarget, relativeTo: targetWindow, generation: generation), then: finish)
+        } else {
+            finish()
         }
     }
 
-    static func pulseClick(
+    func pulseClick(
         at targetPoint: CGPoint,
         clickCount: Int,
         mouseButton: MouseButtonKind,
@@ -341,7 +628,7 @@ enum SoftwareCursorOverlay {
             return
         }
 
-        let generation = VisualCursorSupport.generation
+        let generation = currentGeneration
         configureOrdering(relativeTo: targetWindow)
         stopIdleAnimation()
         adoptAnchor(anchor)
@@ -351,14 +638,15 @@ enum SoftwareCursorOverlay {
         seedVisualDynamicsIfNeeded(at: constrainedTarget, time: now)
         restingTipPosition = constrainedTarget
         observationPhase = "pulse"
-        animateClickPulse(at: constrainedTarget, clickCount: max(clickCount, 1), mouseButton: mouseButton, generation: generation)
-        guard VisualCursorSupport.isCurrent(generation) else { return }
-        lastInteractionEnd = CACurrentMediaTime()
-        startIdleAnimation()
-        scheduleHide(after: visualCursorPostInteractionIdleTimeout())
+        play(clickPulseLoop(at: constrainedTarget, clickCount: max(clickCount, 1), mouseButton: mouseButton, generation: generation)) { [weak self] in
+            guard let self, self.isCurrent(generation) else { return }
+            self.lastInteractionEnd = CACurrentMediaTime()
+            self.startIdleAnimation()
+            self.scheduleHide(after: visualCursorPostInteractionIdleTimeout())
+        }
     }
 
-    static func settle(
+    func settle(
         at targetPoint: CGPoint,
         in targetWindow: CursorTargetWindow?,
         anchor: CursorRestingAnchor? = nil
@@ -384,8 +672,9 @@ enum SoftwareCursorOverlay {
         scheduleHide(after: visualCursorPostInteractionIdleTimeout())
     }
 
-    static func reset(invalidatePending: Bool = true) {
-        if invalidatePending { VisualCursorSupport.invalidatePending() }
+    func reset(invalidatePending: Bool = true) {
+        if invalidatePending { channel?.invalidatePending() }
+        cancelQueuedWork()
         stopIdleAnimation()
         cancelPendingHide()
         lastSeenTipPosition = displayedTipPosition ?? restingTipPosition ?? lastSeenTipPosition
@@ -394,7 +683,7 @@ enum SoftwareCursorOverlay {
         activeTargetWindow = nil
         restingAnchor = nil
         lastAnchorFrame = nil
-        CursorWindowFrameTracker.forgetAll()
+        frames.forgetAll()
         visualDynamicsState = nil
         tempo = 1
         lastInteractionEnd = nil
@@ -409,9 +698,9 @@ enum SoftwareCursorOverlay {
     /// Re-derive a target point that was computed from a snapshot taken before
     /// the window moved. Element frames are window-relative, so the anchored
     /// point follows the window instead of staying on the display it just left.
-    private static func liveTargetPoint(_ targetPoint: CGPoint, anchor: CursorRestingAnchor?) -> CGPoint {
+    private func liveTargetPoint(_ targetPoint: CGPoint, anchor: CursorRestingAnchor?) -> CGPoint {
         guard let anchor,
-              let liveFrame = CursorWindowFrameTracker.liveFrame(for: anchor.windowID),
+              let liveFrame = frames.liveFrame(for: anchor.windowID),
               let screenStatePoint = anchor.screenStatePoint(liveFrame: liveFrame)
         else {
             return targetPoint
@@ -423,20 +712,20 @@ enum SoftwareCursorOverlay {
         )
     }
 
-    private static func adoptAnchor(_ anchor: CursorRestingAnchor?) {
+    private func adoptAnchor(_ anchor: CursorRestingAnchor?) {
         if restingAnchor != anchor {
             restingAnchor = anchor
             lastAnchorFrame = anchor?.windowBounds
         }
-        if anchor == nil { CursorWindowFrameTracker.forgetAll() }
+        if anchor == nil { frames.forgetAll() }
     }
 
     /// Relocate the visible tip, not just its spring target. Otherwise an old
     /// travel velocity can leave it on the previous display after reanchoring.
     @discardableResult
-    private static func reanchorIfWindowMoved() -> Bool {
+    private func reanchorIfWindowMoved() -> Bool {
         guard let anchor = restingAnchor,
-              let liveFrame = CursorWindowFrameTracker.liveFrame(for: anchor.windowID),
+              let liveFrame = frames.liveFrame(for: anchor.windowID),
               liveFrame != lastAnchorFrame,
               let screenStatePoint = anchor.screenStatePoint(liveFrame: liveFrame)
         else {
@@ -464,11 +753,11 @@ enum SoftwareCursorOverlay {
     /// the cursor. A one-shot `call` makes none: its cursor would vanish when it
     /// exits, and played inline on the main thread it held the click until the
     /// glide ended.
-    private static var canPresentOverlay: Bool {
+    private var canPresentOverlay: Bool {
         NSApp != nil && !NSScreen.screens.isEmpty
     }
 
-    private static func prepareWindowIfNeeded() {
+    private func prepareWindowIfNeeded() {
         guard panel == nil else {
             return
         }
@@ -488,17 +777,19 @@ enum SoftwareCursorOverlay {
         panel.animationBehavior = .none
 
         let view = SoftwareCursorView(frame: CGRect(origin: .zero, size: artwork.geometry.windowSize))
+        view.tint = tint
+        view.isHidden = visualCursorBlankInTests
         panel.contentView = view
 
         self.panel = panel
         self.cursorView = view
     }
 
-    private static func configureOrdering(relativeTo targetWindow: CursorTargetWindow?) {
+    private func configureOrdering(relativeTo targetWindow: CursorTargetWindow?) {
         configureOrdering(relativeTo: targetWindow, forceReorder: false)
     }
 
-    private static func configureOrdering(relativeTo targetWindow: CursorTargetWindow?, forceReorder: Bool) {
+    private func configureOrdering(relativeTo targetWindow: CursorTargetWindow?, forceReorder: Bool) {
         guard let panel else {
             return
         }
@@ -530,18 +821,18 @@ enum SoftwareCursorOverlay {
     /// Lowest tempo a burst of back-to-back actions can reach (see
     /// `adaptiveCursorTempo`). Default 0.15; OPEN_COMPUTER_USE_CURSOR_BURST_FLOOR
     /// overrides it, 1 turns the speed-up off.
-    static let burstTempoFloor = visualCursorBurstFloor(environment: ProcessInfo.processInfo.environment)
+    let burstTempoFloor = visualCursorBurstFloor(environment: ProcessInfo.processInfo.environment)
 
     // The drawn tip follows the path through the visual-dynamics springs. Those
     // run on this clock, not wall time: while a move or pulse plays it advances
     // 1 / tempo times faster, so a sped-up animation is the full-length one
     // played faster and still lands on the target. On wall time the springs
     // trail a sped-up glide, so the click pulse starts short of the target.
-    private static var dynamicsClock: CFTimeInterval = 0
-    private static var dynamicsClockWall: CFTimeInterval?
-    private static var dynamicsRate: Double = 1
+    private var dynamicsClock: CFTimeInterval = 0
+    private var dynamicsClockWall: CFTimeInterval?
+    private var dynamicsRate: Double = 1
 
-    private static func dynamicsTime(at wall: CFTimeInterval) -> CFTimeInterval {
+    private func dynamicsTime(at wall: CFTimeInterval) -> CFTimeInterval {
         if let last = dynamicsClockWall {
             dynamicsClock += max(0, wall - last) * dynamicsRate
         }
@@ -549,34 +840,41 @@ enum SoftwareCursorOverlay {
         return dynamicsClock
     }
 
-    private static func paceDynamics(_ paced: Bool) {
+    private func paceDynamics(_ paced: Bool, tempo pacedTempo: Double? = nil) {
         _ = dynamicsTime(at: CACurrentMediaTime())
-        dynamicsRate = paced ? 1 / max(tempo, 0.001) : 1
+        dynamicsRate = paced ? 1 / max(pacedTempo ?? tempo, 0.001) : 1
     }
 
-    private static func animateMove(from start: CGPoint, to end: CGPoint, relativeTo targetWindow: CursorTargetWindow?, generation: UInt64) {
+    private func moveLoop(from start: CGPoint, to end: CGPoint, relativeTo targetWindow: CursorTargetWindow?, generation: UInt64) -> () -> Bool {
         let candidate = bestMotionCandidate(from: start, to: end, relativeTo: targetWindow)
         let path = candidate.path
-        // Use the recovered official progress spring timing instead of the older
-        // distance-compressed local duration, otherwise medium and long moves feel
-        // noticeably faster than the bundled app.
-        let duration = OfficialCursorMotionModel.calibratedTravelDuration(
+        // The recovered official spring shape, played over a hand-speed duration (see
+        // `visualCursorTravelDuration`). The springs run on the paced clock, so a faster
+        // glide is the same motion played faster and still lands on the target.
+        let calibrated = OfficialCursorMotionModel.calibratedTravelDuration(
             distance: distanceBetween(start, end),
             measurement: candidate.measurement
-        ) * tempo
+        )
+        let travel = visualCursorTravelDuration(distance: distanceBetween(start, end), calibrated: calibrated)
+        let travelTempo = tempo * Double(travel / max(calibrated, 0.001))
+        let duration = calibrated * CGFloat(travelTempo)
         let springTargetDuration = OfficialCursorMotionModel.closeEnoughTime
-        paceDynamics(true)
-        defer { paceDynamics(false) }
+        paceDynamics(true, tempo: travelTempo)
         let startTime = CACurrentMediaTime()
         var progress: CGFloat = 0
         var springState = CursorMotionSpringState()
 
-        while true {
-            guard VisualCursorSupport.isCurrent(generation) else { return }
-            refreshActiveOrderingIfNeeded()
+        return { [weak self] in
+            guard let self else { return false }
+            guard self.isCurrent(generation) else {
+                self.paceDynamics(false)
+                return false
+            }
+            self.refreshActiveOrderingIfNeeded()
 
-            if reanchorIfWindowMoved() {
-                return
+            if self.reanchorIfWindowMoved() {
+                self.paceDynamics(false)
+                return false
             }
 
             let elapsed = CGFloat(CACurrentMediaTime() - startTime)
@@ -589,32 +887,31 @@ enum SoftwareCursorOverlay {
             )
 
             let sample = path.sample(at: progress)
-            placeCursor(
-                using: advanceVisualDynamics(
+            self.placeCursor(
+                using: self.advanceVisualDynamics(
                     toward: sample.point,
                     at: CACurrentMediaTime()
                 ),
                 clickProgress: 0
             )
 
-            if normalizedElapsed >= 1 || CursorMotionProgressAnimator.isCloseEnough(progress: progress) {
-                break
+            if normalizedElapsed < 1, !CursorMotionProgressAnimator.isCloseEnough(progress: progress) {
+                return true
             }
 
-            pumpFrame()
+            self.paceDynamics(false)
+            self.placeCursor(
+                using: self.advanceVisualDynamics(
+                    toward: end,
+                    at: CACurrentMediaTime()
+                ),
+                clickProgress: 0
+            )
+            return false
         }
-
-        guard VisualCursorSupport.isCurrent(generation) else { return }
-        placeCursor(
-            using: advanceVisualDynamics(
-                toward: end,
-                at: CACurrentMediaTime()
-            ),
-            clickProgress: 0
-        )
     }
 
-    private static func bestMotionCandidate(from start: CGPoint, to end: CGPoint, relativeTo targetWindow: CursorTargetWindow?) -> CursorMotionCandidate {
+    private func bestMotionCandidate(from start: CGPoint, to end: CGPoint, relativeTo targetWindow: CursorTargetWindow?) -> CursorMotionCandidate {
         let bounds = motionBounds(from: start, to: end)
         let candidates = HeadingDrivenCursorMotionModel.makeCandidates(
             start: start,
@@ -673,21 +970,21 @@ enum SoftwareCursorOverlay {
         return defaultCandidate
     }
 
-    private static func currentForwardVector() -> CGVector {
+    private func currentForwardVector() -> CGVector {
         let renderRotation = cursorView?.rotation ?? 0
         return forwardVector(renderRotation: renderRotation)
     }
 
-    private static func restingForwardVector() -> CGVector {
+    private func restingForwardVector() -> CGVector {
         forwardVector(renderRotation: 0)
     }
 
-    private static func forwardVector(renderRotation: CGFloat) -> CGVector {
+    private func forwardVector(renderRotation: CGFloat) -> CGVector {
         let angle = visualCursorAppKitForwardHeading(renderRotation: renderRotation)
         return CGVector(dx: cos(angle), dy: sin(angle))
     }
 
-    private static func windowConstraintHitCount(
+    private func windowConstraintHitCount(
         for path: CursorMotionPath,
         relativeTo targetWindow: CursorTargetWindow,
         excludingWindowNumber: Int
@@ -699,7 +996,7 @@ enum SoftwareCursorOverlay {
         }
     }
 
-    private static func motionBounds(from start: CGPoint, to end: CGPoint) -> CGRect? {
+    private func motionBounds(from start: CGPoint, to end: CGPoint) -> CGRect? {
         let startScreen = screen(containing: start) ?? NSScreen.main ?? NSScreen.screens.first
         let endScreen = screen(containing: end) ?? startScreen
 
@@ -715,7 +1012,7 @@ enum SoftwareCursorOverlay {
         }
     }
 
-    private static func candidatePreference(_ lhs: CursorMotionCandidate, _ rhs: CursorMotionCandidate) -> Bool {
+    private func candidatePreference(_ lhs: CursorMotionCandidate, _ rhs: CursorMotionCandidate) -> Bool {
         if lhs.measurement.staysInBounds != rhs.measurement.staysInBounds {
             return lhs.measurement.staysInBounds && !rhs.measurement.staysInBounds
         }
@@ -725,7 +1022,7 @@ enum SoftwareCursorOverlay {
         return lhs.identifier < rhs.identifier
     }
 
-    private static func windowID(at point: CGPoint, excludingWindowNumber: Int) -> CGWindowID? {
+    private func windowID(at point: CGPoint, excludingWindowNumber: Int) -> CGWindowID? {
         let windowNumber = NSWindow.windowNumber(
             at: NSPoint(x: point.x, y: point.y),
             belowWindowWithWindowNumber: excludingWindowNumber
@@ -738,7 +1035,7 @@ enum SoftwareCursorOverlay {
         return CGWindowID(windowNumber)
     }
 
-    private static func isWindowPresent(_ windowID: CGWindowID) -> Bool {
+    private func isWindowPresent(_ windowID: CGWindowID) -> Bool {
         guard windowID != 0,
               let windowInfo = CGWindowListCopyWindowInfo([.optionIncludingWindow], windowID) as? [[String: Any]]
         else {
@@ -748,7 +1045,7 @@ enum SoftwareCursorOverlay {
         return !windowInfo.isEmpty
     }
 
-    private static func refreshActiveOrderingIfNeeded() {
+    private func refreshActiveOrderingIfNeeded() {
         guard let activeTargetWindow else {
             return
         }
@@ -761,53 +1058,58 @@ enum SoftwareCursorOverlay {
         configureOrdering(relativeTo: nil)
     }
 
-    private static func animateClickPulse(at point: CGPoint, clickCount: Int, mouseButton: MouseButtonKind, generation: UInt64) {
+    private func clickPulseLoop(at point: CGPoint, clickCount: Int, mouseButton: MouseButtonKind, generation: UInt64) -> () -> Bool {
         let pulseBias: CGFloat = mouseButton == .right ? 0.82 : 1
         paceDynamics(true)
-        defer { paceDynamics(false) }
+        var pulse = 0
+        var pausing = false
+        var phaseStart = CACurrentMediaTime()
 
-        for pulse in 0..<clickCount {
-            let duration = 0.16 * tempo
-            let startTime = CACurrentMediaTime()
-
-            while true {
-                guard VisualCursorSupport.isCurrent(generation) else { return }
-                _ = reanchorIfWindowMoved()
-                let elapsed = CACurrentMediaTime() - startTime
-                let rawProgress = min(max(elapsed / duration, 0), 1)
-                let clickProgress = sin(rawProgress * .pi) * pulseBias
-
-                placeCursor(
-                    using: advanceVisualDynamics(
-                        toward: restingTipPosition ?? point,
-                        at: CACurrentMediaTime()
-                    ),
-                    clickProgress: clickProgress
-                )
-
-                if rawProgress >= 1 {
-                    break
-                }
-
-                pumpFrame()
+        return { [weak self] in
+            guard let self else { return false }
+            guard self.isCurrent(generation) else {
+                self.paceDynamics(false)
+                return false
             }
 
-            if pulse < clickCount - 1 {
-                pause(for: 0.05 * tempo)
+            let now = CACurrentMediaTime()
+            if pausing {
+                if now - phaseStart < 0.05 * self.tempo { return true }
+                pausing = false
+                phaseStart = now
             }
+
+            _ = self.reanchorIfWindowMoved()
+            let rawProgress = min(max((now - phaseStart) / (visualCursorClickPulseDuration * self.tempo), 0), 1)
+            self.placeCursor(
+                using: self.advanceVisualDynamics(
+                    toward: self.restingTipPosition ?? point,
+                    at: CACurrentMediaTime()
+                ),
+                clickProgress: sin(rawProgress * .pi) * pulseBias
+            )
+            if rawProgress < 1 { return true }
+
+            pulse += 1
+            if pulse < clickCount {
+                pausing = true
+                phaseStart = CACurrentMediaTime()
+                return true
+            }
+
+            self.paceDynamics(false)
+            self.placeCursor(
+                using: self.advanceVisualDynamics(
+                    toward: self.restingTipPosition ?? point,
+                    at: CACurrentMediaTime()
+                ),
+                clickProgress: 0
+            )
+            return false
         }
-
-        guard VisualCursorSupport.isCurrent(generation) else { return }
-        placeCursor(
-            using: advanceVisualDynamics(
-                toward: restingTipPosition ?? point,
-                at: CACurrentMediaTime()
-            ),
-            clickProgress: 0
-        )
     }
 
-    private static func startIdleAnimation() {
+    private func startIdleAnimation() {
         stopIdleAnimation()
         guard canPresentOverlay, let restingTipPosition else {
             return
@@ -816,37 +1118,9 @@ enum SoftwareCursorOverlay {
         observationPhase = "idle"
         idlePhase = 0
         idleTicks = 0
-        let timer = Timer(timeInterval: 1 / 60, repeats: true) { _ in
+        let timer = Timer(timeInterval: 1 / 60, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard panel != nil, cursorView != nil else {
-                    return
-                }
-
-                // A refresh is three window-server round trips; every frame they were most of
-                // the sway's cost. At 10 Hz the cursor is back above a raised target window
-                // within 0.1 s.
-                idleTicks += 1
-                if idleTicks % 6 == 0 {
-                    refreshActiveOrderingIfNeeded()
-                }
-                _ = reanchorIfWindowMoved()
-                guard let currentTipPosition = self.restingTipPosition else { return }
-
-                observationPhase = "idle"
-                idlePhase += 0.05
-                let idlePose = visualCursorIdlePose(
-                    restingTipPosition: currentTipPosition,
-                    phase: idlePhase
-                )
-
-                placeCursor(
-                    using: advanceVisualDynamics(
-                        toward: idlePose.tipPosition,
-                        idleAngleOffset: idlePose.angleOffset,
-                        at: CACurrentMediaTime()
-                    ),
-                    clickProgress: 0
-                )
+                self?.idleTick()
             }
         }
 
@@ -862,28 +1136,60 @@ enum SoftwareCursorOverlay {
         )
     }
 
-    private static func stopIdleAnimation() {
+    private func idleTick() {
+        guard panel != nil, cursorView != nil else {
+            return
+        }
+
+        // A refresh is three window-server round trips; every frame they were most of
+        // the sway's cost. At 10 Hz the cursor is back above a raised target window
+        // within 0.1 s.
+        idleTicks += 1
+        if idleTicks % 6 == 0 {
+            refreshActiveOrderingIfNeeded()
+        }
+        _ = reanchorIfWindowMoved()
+        guard let currentTipPosition = restingTipPosition else { return }
+
+        observationPhase = "idle"
+        idlePhase += 0.05
+        let idlePose = visualCursorIdlePose(
+            restingTipPosition: currentTipPosition,
+            phase: idlePhase
+        )
+
+        placeCursor(
+            using: advanceVisualDynamics(
+                toward: idlePose.tipPosition,
+                idleAngleOffset: idlePose.angleOffset,
+                at: CACurrentMediaTime()
+            ),
+            clickProgress: 0
+        )
+    }
+
+    private func stopIdleAnimation() {
         idleTimer?.invalidate()
         idleTimer = nil
     }
 
-    private static func scheduleHide(after delay: TimeInterval) {
+    private func scheduleHide(after delay: TimeInterval) {
         cancelPendingHide()
-        let timer = Timer(timeInterval: delay, repeats: false) { _ in
+        let timer = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated {
-                hideOverlay()
+                self?.hideOverlay()
             }
         }
         RunLoop.main.add(timer, forMode: .common)
         hideTimer = timer
     }
 
-    private static func cancelPendingHide() {
+    private func cancelPendingHide() {
         hideTimer?.invalidate()
         hideTimer = nil
     }
 
-    private static func hideOverlay() {
+    private func hideOverlay() {
         guard let panel else {
             return
         }
@@ -895,32 +1201,36 @@ enum SoftwareCursorOverlay {
             context.duration = 0.12
             context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
             panel.animator().alphaValue = 0
-        } completionHandler: {
+        } completionHandler: { [weak self] in
             MainActor.assumeIsolated {
-                panel.orderOut(nil)
-                panel.alphaValue = 1
-                lastSeenTipPosition = displayedTipPosition ?? restingTipPosition ?? lastSeenTipPosition
-                displayedTipPosition = nil
-                restingTipPosition = nil
-                activeTargetWindow = nil
-                restingAnchor = nil
-                lastAnchorFrame = nil
-                CursorWindowFrameTracker.forgetAll()
-                visualDynamicsState = nil
-                observationPhase = "hidden"
-                writeObservationSnapshot(tipPosition: nil, rotation: nil)
+                self?.finishHide(panel)
             }
         }
     }
 
-    private static func defaultInitialTipPosition() -> CGPoint {
+    private func finishHide(_ panel: NSPanel) {
+        panel.orderOut(nil)
+        panel.alphaValue = 1
+        lastSeenTipPosition = displayedTipPosition ?? restingTipPosition ?? lastSeenTipPosition
+        displayedTipPosition = nil
+        restingTipPosition = nil
+        activeTargetWindow = nil
+        restingAnchor = nil
+        lastAnchorFrame = nil
+        frames.forgetAll()
+        visualDynamicsState = nil
+        observationPhase = "hidden"
+        writeObservationSnapshot(tipPosition: nil, rotation: nil)
+    }
+
+    private func defaultInitialTipPosition() -> CGPoint {
         defaultVisualCursorInitialTipPosition(
             windowOrigin: .zero,
             tipAnchor: artwork.geometry.tipAnchor
         )
     }
 
-    private static func initialRenderState(at tipPosition: CGPoint) -> CursorVisualRenderState {
+    private func initialRenderState(at tipPosition: CGPoint) -> CursorVisualRenderState {
         CursorVisualRenderState(
             tipPosition: tipPosition,
             rotation: 0,
@@ -931,7 +1241,7 @@ enum SoftwareCursorOverlay {
         )
     }
 
-    private static func seedVisualDynamicsIfNeeded(at tipPosition: CGPoint, time: CFTimeInterval) {
+    private func seedVisualDynamicsIfNeeded(at tipPosition: CGPoint, time: CFTimeInterval) {
         guard visualDynamicsState == nil else {
             return
         }
@@ -942,7 +1252,7 @@ enum SoftwareCursorOverlay {
         )
     }
 
-    private static func advanceVisualDynamics(
+    private func advanceVisualDynamics(
         toward targetTipPosition: CGPoint,
         idleAngleOffset: CGFloat = 0,
         at time: CFTimeInterval
@@ -963,7 +1273,7 @@ enum SoftwareCursorOverlay {
         return result.renderState
     }
 
-    private static func placeCursor(using renderState: CursorVisualRenderState, clickProgress: CGFloat) {
+    private func placeCursor(using renderState: CursorVisualRenderState, clickProgress: CGFloat) {
         guard let panel, let cursorView else {
             return
         }
@@ -983,7 +1293,7 @@ enum SoftwareCursorOverlay {
         )
     }
 
-    private static func writeObservationSnapshot(tipPosition: CGPoint?, rotation: CGFloat?) {
+    private func writeObservationSnapshot(tipPosition: CGPoint?, rotation: CGFloat?) {
         // Every frame: copying the whole environment only to find the variable unset was not free.
         guard
             getenv("OPEN_COMPUTER_USE_VISUAL_CURSOR_OBSERVATION_FILE") != nil,
@@ -1010,7 +1320,7 @@ enum SoftwareCursorOverlay {
         }
     }
 
-    private static func clampTipPosition(_ tipPosition: CGPoint) -> CGPoint {
+    private func clampTipPosition(_ tipPosition: CGPoint) -> CGPoint {
         guard let screen = screen(containing: tipPosition) ?? NSScreen.main ?? NSScreen.screens.first else {
             return tipPosition
         }
@@ -1027,22 +1337,15 @@ enum SoftwareCursorOverlay {
         )
     }
 
-    private static func screen(containing point: CGPoint) -> NSScreen? {
+    private func screen(containing point: CGPoint) -> NSScreen? {
         NSScreen.screens.first { $0.frame.contains(point) }
     }
 
-    private static func pumpFrame() {
+    private func pumpFrame() {
         RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(1 / 120))
     }
 
-    private static func pause(for duration: TimeInterval) {
-        let start = CACurrentMediaTime()
-        while CACurrentMediaTime() - start < duration {
-            pumpFrame()
-        }
-    }
-
-    private static func distanceBetween(_ lhs: CGPoint, _ rhs: CGPoint) -> CGFloat {
+    private func distanceBetween(_ lhs: CGPoint, _ rhs: CGPoint) -> CGFloat {
         hypot(rhs.x - lhs.x, rhs.y - lhs.y)
     }
 }
@@ -1068,6 +1371,7 @@ private final class SoftwareCursorView: NSView {
     var fogOpacity: CGFloat = 0.12
     var fogScale: CGFloat = 1
     var clickProgress: CGFloat = 0
+    var tint: NSColor?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1103,7 +1407,8 @@ private final class SoftwareCursorView: NSView {
                 fogOpacity: fogOpacity,
                 fogScale: fogScale,
                 clickProgress: clickProgress
-            )
+            ),
+            tint: tint
         )
     }
 }

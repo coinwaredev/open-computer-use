@@ -41,6 +41,7 @@ press_key
 set_value
 select_text   (macOS runtime only)
 key_sequence  (macOS runtime only)
+choose_file   (macOS runtime only)
 ```
 
 macOS also exposes `query` for targeted AX lookup. These nine core tools remain the cross-platform compatibility surface. The bundled Codex plugin uses a
@@ -276,6 +277,18 @@ Games read held keys every frame, so a plain `press_key` tap (key-down and key-u
 
 Game views (Roblox Studio and similar) are opaque to Accessibility: click them by window coordinates with `click_method: "sky_click"` and send keys with `key_method: "sky_key"`; the default `auto` methods do not reach them. Each call blocks until its keys are released, so it cannot react mid-sequence.
 
+### File pickers (macOS)
+
+An Open panel's file list is drawn by a separate macOS service, so `press_key` (`cmd+shift+g`, Go to Folder), `type_text` and pointer clicks of any method never reach it. Accessibility does. Open the panel with the app's own menu item, then call `choose_file` with the file's path:
+
+```json
+{"app":"Roblox Studio","path":"~/Documents/art/model.fbx"}
+```
+
+It opens a sidebar place above the path (the disk, Home, Documents, a volume), opens each folder down to the file, selects the file and presses Open. It sends no keys or pointer events, so it runs in the background. A panel in icon or column view is switched to list view first, and the result says so.
+
+It refuses hidden paths (dot-files, `/tmp`, `/private`), folders, Save panels, and files the panel greys out (wrong type). A panel whose window is on another Space, or behind a full-screen app, doesn't load its files, and the call fails with that hint; switch to the app's desktop first.
+
 ## Drag Delivery
 
 `drag` has no method parameter. On macOS the path it takes is decided by the same process-level gate that authorizes `click_method: "global"`:
@@ -307,6 +320,14 @@ the app or fall back to keyboard/pointer input. Linux and Windows do not impleme
 
 ## Software Cursor
 
+Each MCP session (on macOS, each client connection to the App Agent, so each agent chat) draws its own
+cursor, tinted in its own colour: blue, orange, green, pink, purple, teal, in the order sessions first
+draw one, then repeating. One session's cursor work, session end and `notifications/turn-ended` never
+move or hide another's. The host-wide `turn-ended` CLI notification names no session, so it resets
+every cursor. The one-shot CLI and the default cursor keep the original colours. Sessions' cursors
+animate at the same time: each plays its own queue of moves and clicks on its own frame timer, so one
+chat's glide never holds up another's.
+
 A cursor with no current position (a new session, or after the 30 s idle hide) starts its first move
 where it was last seen, else at the user's real pointer, instead of flying in from the screen origin.
 
@@ -324,9 +345,13 @@ This follows the window's position, not layout changes inside it. Refresh app st
 before choosing another target. Input delivery continues to use the existing action paths.
 
 The tool call does not wait for the cursor animation: the action returns while the cursor finishes its
-travel and click feedback. Back-to-back actions play faster, down to 15% of the normal length
+travel and click feedback. A glide takes hand speed: about 0.2 s across a window, never more than
+0.4 s (`OPEN_COMPUTER_USE_CURSOR_MOTION=classic` restores the original 1.4 s spring timing). Back-to-back actions play faster, down to 15% of the normal length
 (`OPEN_COMPUTER_USE_CURSOR_BURST_FLOOR`; a finite positive number, capped at `1`, which turns this off; invalid values use `0.15`), and return to normal after 2 s without
-actions. Window screenshots never include the cursor. A one-shot `open-computer-use call` draws no
+actions. After an accessibility action, the read-back waits at most 40 ms for the redraw
+(`OPEN_COMPUTER_USE_READ_BACK_SETTLE_MS`; it was 100-150 ms) and reuses the app it already resolved, and the
+snapshot no longer walks closed menus under the menu bar (their items were never printed). A TextEdit click with
+read-back went from about 350 ms to 140 ms. Window screenshots never include the cursor. A one-shot `open-computer-use call` draws no
 cursor: it would disappear when the process exits. The MCP server and the app agent draw it.
 Turn end or session cleanup cancels unfinished and queued cursor animations; old animations cannot
 show the cursor again after cleanup.
